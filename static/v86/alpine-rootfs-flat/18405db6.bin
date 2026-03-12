@@ -1,0 +1,14 @@
+
+GREEN="\e[0;32m"
+RED="\e[0;31m"
+TEAL="\e[0;36m"
+NC="\e[0m" # No Color
+
+PS1="\
+\$(exit_status=\$?; \
+if [ \$exit_status -ne 0 ]; then \
+    echo -e \"\${RED}\w\${NC} ${RED}❯ \${NC}\"; \
+else \
+    echo -e \"\${TEAL}\w\${NC} \${GREEN}❯ \${NC}\"; \
+fi)\
+"
