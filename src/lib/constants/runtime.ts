@@ -5,31 +5,16 @@ export const RUNTIME_WHEELS = [
   'wheels/snakemake_executor_plugin_wasm-0.1.0-py3-none-any.whl'
 ];
 
-export const DEFAULT_CONFIG = `samples:
-  - mutant
-reads_dir: "data"
-out_dir: "results"
-adapters:
-  - "AGATCGGAAGAGC"
-  - "CTGTCTCTTATACACATCT"
-trim:
-  min_length: 50
-  min_mean_quality: 20
-  trim_trailing_below: 20
-kmer:
-  k: 5
-  top_n: 100
-`;
+export const DEFAULT_CONFIG = `message: "Snakemake ❤️ Wasm"`;
 
 export const FALLBACK_SNAKEFILE = String.raw`rule all:
     input:
-        "results/hello.txt"
+        "hello.txt"
 
-rule make_hello:
+rule hello:
     output:
-        "results/hello.txt"
-    run:
-        from pathlib import Path
-        Path(output[0]).parent.mkdir(parents=True, exist_ok=True)
-        Path(output[0]).write_text("hello from snakemake in pyodide", encoding="utf-8")
-`;
+        "hello.txt"
+    params: 
+        msg=config.get("message")
+    shell:
+        "echo '{params.msg}' > {output}"`;

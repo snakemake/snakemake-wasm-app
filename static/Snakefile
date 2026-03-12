@@ -1,9 +1,11 @@
 rule all:
     input:
         "hello.txt"
-        
+
 rule hello:
     output:
         "hello.txt"
+    params: 
+        msg=config.get("message")
     shell:
-        "echo 'Snakemake ❤️ Wasm'  > {output}"
+        "echo '{params.msg}' > {output}"
