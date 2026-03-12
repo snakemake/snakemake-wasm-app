@@ -103,8 +103,6 @@
 	let runDisabled = true;
 	let isRunning = false;
 	let shellReady = false;
-	let unsupportedDevice = false;
-	let unsupportedDetail = '';
 	let terminalElement: HTMLDivElement | null = null;
 	let tabs: IdeTabItem[] = [
 		{ id: createId(), path: 'Snakefile', content: FALLBACK_SNAKEFILE },
@@ -114,6 +112,7 @@
 	const uploadedFiles = new Map<string, { payload: InputFilePayload; sizeBytes: number }>();
 	let runtimeFiles: RuntimeFileItem[] = [];
 	let outputUrls: string[] = [];
+	let mobileUnsupported = false;
 
 	let worker: Worker | null = null;
 	let workerRuntimeReady = false;
@@ -128,6 +127,14 @@
 
 	const IDE_STATE_HASH_KEY = 'code';
 	const RUNTIME_FILES_PARAM_KEY = 'runtimefiles';
+
+	const isMobileDevice = (): boolean => {
+		if (typeof window === 'undefined') return false;
+		const ua = navigator.userAgent || '';
+		const mobileUa = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(ua);
+		const coarsePointer = window.matchMedia?.('(pointer: coarse)').matches ?? false;
+		return mobileUa || coarsePointer;
+	};
 
 	const toBase64Url = (input: string): string =>
 		input.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
@@ -234,21 +241,6 @@
 			.join(' ');
 		logs = [...logs, line];
 		console.log(...parts);
-	};
-
-	const isUnsupportedDeviceError = (errorText: string): boolean => {
-		const normalized = errorText.toLowerCase();
-		return (
-			normalized.includes('webassembly stack switching not supported') ||
-			normalized.includes('does not support webassembly stack switching')
-		);
-	};
-
-	const markUnsupportedDevice = (errorText: string) => {
-		unsupportedDevice = true;
-		unsupportedDetail = errorText;
-		runDisabled = true;
-		isRunning = false;
 	};
 
 	const setTerminalRef = (element: HTMLDivElement | null) => {
@@ -614,12 +606,8 @@
 				return;
 			}
 			if (msg.type === 'init-error') {
-				const initError = String(msg.error ?? 'unknown');
-				if (isUnsupportedDeviceError(initError)) {
-					markUnsupportedDevice(initError);
-				}
 				workerRuntimeReady = false;
-				runDisabled = unsupportedDevice ? true : false;
+				runDisabled = false;
 				workerRuntimeInitReject?.(new Error(msg.error ?? 'unknown'));
 				resetWorkerRuntimeInitLatch();
 				appendLog('[ui] prewarm: worker runtime failed', msg.error ?? 'unknown');
@@ -658,13 +646,10 @@
 			}
 			if (msg.type === 'error') {
 				const errorText = String(msg.error ?? 'Unknown worker error');
-				if (isUnsupportedDeviceError(errorText)) {
-					markUnsupportedDevice(errorText);
-				}
 				if (workerRuntimeInitInFlight && errorText.includes('Unsupported message type: init')) {
 					workerInitSupported = false;
 					workerRuntimeReady = false;
-					runDisabled = unsupportedDevice ? true : false;
+					runDisabled = false;
 					workerRuntimeInitResolve?.();
 					resetWorkerRuntimeInitLatch();
 					appendLog('[ui] prewarm: worker init not supported, falling back to run-time init');
@@ -672,22 +657,18 @@
 				}
 				appendLog('[error]', errorText);
 				isRunning = false;
-				runDisabled = unsupportedDevice ? true : false;
+				runDisabled = false;
 			}
 		};
 
 		worker.onerror = (event) => {
 			appendLog('[worker onerror]', event.message, event.filename, event.lineno, event.colno);
 			isRunning = false;
-			runDisabled = unsupportedDevice ? true : false;
+			runDisabled = false;
 		};
 	};
 
 	const runWorkflow = async () => {
-		if (unsupportedDevice) {
-			appendLog('[ui] run blocked: this device is not supported');
-			return;
-		}
 		if (!worker) return;
 		const runInputs = buildRunInputsFromTabs();
 		if (!runInputs) return;
@@ -704,7 +685,7 @@
 		} catch (error) {
 			appendLog('[error]', String(error));
 			isRunning = false;
-			runDisabled = unsupportedDevice ? true : false;
+			runDisabled = false;
 			return;
 		}
 
@@ -736,6 +717,12 @@
 	$: tabs, activeTabId, scheduleIdeStatePersist();
 
 	onMount(() => {
+		if (isMobileDevice()) {
+			mobileUnsupported = true;
+			window.alert('Snakemake Wasm is not supported on mobile');
+			return;
+		}
+
 		setupWorker();
 		const restoredFromUrl = applyIdeStateFromUrl();
 		ideUrlSyncReady = true;
@@ -792,7 +779,14 @@
 	});
 </script>
 
-<main class="w-full px-4 py-4 lg:h-screen lg:overflow-hidden">
+	{#if mobileUnsupported}
+		<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+			<div class="w-full max-w-sm rounded border border-slate-300 bg-white p-4 text-center shadow">
+				<p class="text-sm text-slate-800">Snakemake Wasm is not supported on mobile</p>
+			</div>
+		</div>
+	{:else}
+		<main class="w-full px-4 py-4 lg:h-screen lg:overflow-hidden">
 	<div class="grid grid-cols-1 gap-4 lg:h-full xl:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
 		<section class="min-h-0 flex flex-col gap-2 bg-slate-50">
 			<div class="min-h-0 flex-1 ">
@@ -843,15 +837,5 @@
 			</div>
 		</section>
 	</div>
-
-	{#if unsupportedDevice}
-		<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-6">
-			<div class="w-full max-w-md border border-slate-200 bg-white p-4">
-				<p class="text-sm font-medium text-slate-900">this device is not supported</p>
-				{#if unsupportedDetail}
-					<p class="mt-2 text-xs text-slate-600">{unsupportedDetail}</p>
-				{/if}
-			</div>
-		</div>
-	{/if}
 </main>
+	{/if}
