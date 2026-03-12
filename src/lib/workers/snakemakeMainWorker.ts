@@ -82,6 +82,19 @@ async function getPyodide() {
   return pyodidePromise;
 }
 
+async function ensureRuntimeSupported(pyodide) {
+  const canRunSync = await pyodide.runPythonAsync(`
+from pyodide.webloop import can_run_sync
+can_run_sync()
+`);
+
+  if (!canRunSync) {
+    throw new Error(
+      "This browser/runtime does not support synchronous execution from Pyodide's event loop (can_run_sync() is false)."
+    );
+  }
+}
+
 async function ensureRuntime(pyodide, wheels) {
   if (runtimeReady) {
     return;
@@ -94,6 +107,8 @@ async function ensureRuntime(pyodide, wheels) {
 
   runtimeInitPromise = (async () => {
     postProgress({ stage: "runtime", status: "starting" });
+    postLog("Checking runtime support (pyodide.webloop.can_run_sync)");
+    await ensureRuntimeSupported(pyodide);
     postLog("Loading micropip");
     if (MICROPIP_WHEEL_NAME) {
       await pyodide.loadPackage(`${PYODIDE_CDN_BASE_URL}${MICROPIP_WHEEL_NAME}`);

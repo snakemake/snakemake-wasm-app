@@ -112,6 +112,7 @@
 	const uploadedFiles = new Map<string, { payload: InputFilePayload; sizeBytes: number }>();
 	let runtimeFiles: RuntimeFileItem[] = [];
 	let outputUrls: string[] = [];
+	let runtimeSupportMessage: string | null = null;
 
 	let worker: Worker | null = null;
 	let workerRuntimeReady = false;
@@ -232,6 +233,14 @@
 			.join(' ');
 		logs = [...logs, line];
 		console.log(...parts);
+	};
+
+	const toRuntimeSupportMessage = (errorText: string): string | null => {
+		if (!errorText) return null;
+		if (errorText.includes('can_run_sync')) {
+			return 'Snakemake Wasm is not supported in this browser. Please use the latest version of Chrome.';
+		}
+		return null;
 	};
 
 	const setTerminalRef = (element: HTMLDivElement | null) => {
@@ -591,6 +600,7 @@
 			if (msg.type === 'init-ready') {
 				workerRuntimeReady = true;
 				runDisabled = false;
+				runtimeSupportMessage = null;
 				workerRuntimeInitResolve?.();
 				resetWorkerRuntimeInitLatch();
 				appendLog('[ui] prewarm: worker runtime ready');
@@ -599,6 +609,7 @@
 			if (msg.type === 'init-error') {
 				workerRuntimeReady = false;
 				runDisabled = false;
+				runtimeSupportMessage = toRuntimeSupportMessage(String(msg.error ?? ''));
 				workerRuntimeInitReject?.(new Error(msg.error ?? 'unknown'));
 				resetWorkerRuntimeInitLatch();
 				appendLog('[ui] prewarm: worker runtime failed', msg.error ?? 'unknown');
@@ -647,6 +658,7 @@
 					return;
 				}
 				appendLog('[error]', errorText);
+				runtimeSupportMessage = toRuntimeSupportMessage(errorText);
 				isRunning = false;
 				runDisabled = false;
 			}
@@ -654,6 +666,7 @@
 
 		worker.onerror = (event) => {
 			appendLog('[worker onerror]', event.message, event.filename, event.lineno, event.colno);
+			runtimeSupportMessage = toRuntimeSupportMessage(String(event.message ?? ''));
 			isRunning = false;
 			runDisabled = false;
 		};
@@ -663,6 +676,7 @@
 		if (!worker) return;
 		const runInputs = buildRunInputsFromTabs();
 		if (!runInputs) return;
+		runtimeSupportMessage = null;
 
 		runDisabled = true;
 		isRunning = false;
@@ -816,3 +830,20 @@
 		</section>
 	</div>
 </main>
+
+{#if runtimeSupportMessage}
+	<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" role="alertdialog" aria-live="assertive">
+		<div class="w-full max-w-md rounded border border-red-300 bg-white p-4 text-center shadow">
+			<p class="text-sm text-slate-800">{runtimeSupportMessage}</p>
+			<div class="mt-3">
+				<button
+					type="button"
+					class="rounded border border-slate-300 px-3 py-1 text-sm text-slate-700 hover:bg-slate-50"
+					on:click={() => (runtimeSupportMessage = null)}
+				>
+					OK
+				</button>
+			</div>
+		</div>
+	</div>
+{/if}
