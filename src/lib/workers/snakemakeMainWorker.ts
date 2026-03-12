@@ -120,8 +120,6 @@ async function ensureRuntime(pyodide, wheels) {
 
   runtimeInitPromise = (async () => {
     postProgress({ stage: "runtime", status: "starting" });
-    postLog("Checking browser WebAssembly capabilities");
-    await ensureStackSwitchingSupport(pyodide);
     postLog("Loading micropip");
     if (MICROPIP_WHEEL_NAME) {
       await pyodide.loadPackage(`${PYODIDE_CDN_BASE_URL}${MICROPIP_WHEEL_NAME}`);
