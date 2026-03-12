@@ -112,7 +112,6 @@
 	const uploadedFiles = new Map<string, { payload: InputFilePayload; sizeBytes: number }>();
 	let runtimeFiles: RuntimeFileItem[] = [];
 	let outputUrls: string[] = [];
-	let mobileUnsupported = false;
 
 	let worker: Worker | null = null;
 	let workerRuntimeReady = false;
@@ -127,14 +126,6 @@
 
 	const IDE_STATE_HASH_KEY = 'code';
 	const RUNTIME_FILES_PARAM_KEY = 'runtimefiles';
-
-	const isMobileDevice = (): boolean => {
-		if (typeof window === 'undefined') return false;
-		const ua = navigator.userAgent || '';
-		const mobileUa = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(ua);
-		const coarsePointer = window.matchMedia?.('(pointer: coarse)').matches ?? false;
-		return mobileUa || coarsePointer;
-	};
 
 	const toBase64Url = (input: string): string =>
 		input.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
@@ -717,12 +708,6 @@
 	$: tabs, activeTabId, scheduleIdeStatePersist();
 
 	onMount(() => {
-		if (isMobileDevice()) {
-			mobileUnsupported = true;
-			window.alert('Snakemake Wasm is not supported on mobile');
-			return;
-		}
-
 		setupWorker();
 		const restoredFromUrl = applyIdeStateFromUrl();
 		ideUrlSyncReady = true;
@@ -779,14 +764,7 @@
 	});
 </script>
 
-	{#if mobileUnsupported}
-		<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-			<div class="w-full max-w-sm rounded border border-slate-300 bg-white p-4 text-center shadow">
-				<p class="text-sm text-slate-800">Snakemake Wasm is not supported on mobile</p>
-			</div>
-		</div>
-	{:else}
-		<main class="w-full px-4 py-4 lg:h-screen lg:overflow-hidden">
+	<main class="w-full px-4 py-4 lg:h-screen lg:overflow-hidden">
 	<div class="grid grid-cols-1 gap-4 lg:h-full xl:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
 		<section class="min-h-0 flex flex-col gap-2 bg-slate-50">
 			<div class="min-h-0 flex-1 ">
@@ -838,4 +816,3 @@
 		</section>
 	</div>
 </main>
-	{/if}
