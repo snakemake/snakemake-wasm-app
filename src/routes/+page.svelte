@@ -103,6 +103,8 @@
 	let runDisabled = true;
 	let isRunning = false;
 	let shellReady = false;
+	let unsupportedDevice = false;
+	let unsupportedDetail = '';
 	let terminalElement: HTMLDivElement | null = null;
 	let tabs: IdeTabItem[] = [
 		{ id: createId(), path: 'Snakefile', content: FALLBACK_SNAKEFILE },
@@ -232,6 +234,21 @@
 			.join(' ');
 		logs = [...logs, line];
 		console.log(...parts);
+	};
+
+	const isUnsupportedDeviceError = (errorText: string): boolean => {
+		const normalized = errorText.toLowerCase();
+		return (
+			normalized.includes('webassembly stack switching not supported') ||
+			normalized.includes('does not support webassembly stack switching')
+		);
+	};
+
+	const markUnsupportedDevice = (errorText: string) => {
+		unsupportedDevice = true;
+		unsupportedDetail = errorText;
+		runDisabled = true;
+		isRunning = false;
 	};
 
 	const setTerminalRef = (element: HTMLDivElement | null) => {
@@ -597,8 +614,12 @@
 				return;
 			}
 			if (msg.type === 'init-error') {
+				const initError = String(msg.error ?? 'unknown');
+				if (isUnsupportedDeviceError(initError)) {
+					markUnsupportedDevice(initError);
+				}
 				workerRuntimeReady = false;
-				runDisabled = false;
+				runDisabled = unsupportedDevice ? true : false;
 				workerRuntimeInitReject?.(new Error(msg.error ?? 'unknown'));
 				resetWorkerRuntimeInitLatch();
 				appendLog('[ui] prewarm: worker runtime failed', msg.error ?? 'unknown');
@@ -637,10 +658,13 @@
 			}
 			if (msg.type === 'error') {
 				const errorText = String(msg.error ?? 'Unknown worker error');
+				if (isUnsupportedDeviceError(errorText)) {
+					markUnsupportedDevice(errorText);
+				}
 				if (workerRuntimeInitInFlight && errorText.includes('Unsupported message type: init')) {
 					workerInitSupported = false;
 					workerRuntimeReady = false;
-					runDisabled = false;
+					runDisabled = unsupportedDevice ? true : false;
 					workerRuntimeInitResolve?.();
 					resetWorkerRuntimeInitLatch();
 					appendLog('[ui] prewarm: worker init not supported, falling back to run-time init');
@@ -648,18 +672,22 @@
 				}
 				appendLog('[error]', errorText);
 				isRunning = false;
-				runDisabled = false;
+				runDisabled = unsupportedDevice ? true : false;
 			}
 		};
 
 		worker.onerror = (event) => {
 			appendLog('[worker onerror]', event.message, event.filename, event.lineno, event.colno);
 			isRunning = false;
-			runDisabled = false;
+			runDisabled = unsupportedDevice ? true : false;
 		};
 	};
 
 	const runWorkflow = async () => {
+		if (unsupportedDevice) {
+			appendLog('[ui] run blocked: this device is not supported');
+			return;
+		}
 		if (!worker) return;
 		const runInputs = buildRunInputsFromTabs();
 		if (!runInputs) return;
@@ -676,7 +704,7 @@
 		} catch (error) {
 			appendLog('[error]', String(error));
 			isRunning = false;
-			runDisabled = false;
+			runDisabled = unsupportedDevice ? true : false;
 			return;
 		}
 
@@ -815,4 +843,15 @@
 			</div>
 		</section>
 	</div>
+
+	{#if unsupportedDevice}
+		<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-6">
+			<div class="w-full max-w-md border border-slate-200 bg-white p-4">
+				<p class="text-sm font-medium text-slate-900">this device is not supported</p>
+				{#if unsupportedDetail}
+					<p class="mt-2 text-xs text-slate-600">{unsupportedDetail}</p>
+				{/if}
+			</div>
+		</div>
+	{/if}
 </main>

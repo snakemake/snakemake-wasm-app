@@ -82,6 +82,32 @@ async function getPyodide() {
   return pyodidePromise;
 }
 
+async function ensureStackSwitchingSupport(pyodide) {
+  const supported = await pyodide.runPythonAsync(`
+import asyncio
+import sys
+
+if sys.platform != "emscripten":
+    True
+else:
+    loop = asyncio.get_running_loop()
+    try:
+        loop.run_until_complete(asyncio.sleep(0))
+        True
+    except RuntimeError as exc:
+        if "WebAssembly stack switching not supported" in str(exc):
+            False
+        else:
+            raise
+`);
+
+  if (!supported) {
+    throw new Error(
+      "This browser/runtime does not support WebAssembly stack switching, which Snakemake requires in Pyodide. Please use a recent desktop Chrome/Edge/Firefox."
+    );
+  }
+}
+
 async function ensureRuntime(pyodide, wheels) {
   if (runtimeReady) {
     return;
@@ -94,6 +120,8 @@ async function ensureRuntime(pyodide, wheels) {
 
   runtimeInitPromise = (async () => {
     postProgress({ stage: "runtime", status: "starting" });
+    postLog("Checking browser WebAssembly capabilities");
+    await ensureStackSwitchingSupport(pyodide);
     postLog("Loading micropip");
     if (MICROPIP_WHEEL_NAME) {
       await pyodide.loadPackage(`${PYODIDE_CDN_BASE_URL}${MICROPIP_WHEEL_NAME}`);
@@ -218,14 +246,28 @@ _orig_workflow_async_run = snakemake.workflow.Workflow.async_run
 def _pyodide_async_run(coro):
     if sys.platform == "emscripten":
         loop = asyncio.get_running_loop()
-        return loop.run_until_complete(coro)
+    try:
+      return loop.run_until_complete(coro)
+    except RuntimeError as exc:
+      if "WebAssembly stack switching not supported" in str(exc):
+        raise RuntimeError(
+          "This browser/runtime does not support WebAssembly stack switching, which Snakemake requires in Pyodide. Please use a recent desktop Chrome/Edge/Firefox."
+        ) from exc
+      raise
     return _orig_common_async_run(coro)
 
 
 def _pyodide_workflow_async_run(self, coro):
     if sys.platform == "emscripten":
         loop = asyncio.get_running_loop()
-        return loop.run_until_complete(coro)
+    try:
+      return loop.run_until_complete(coro)
+    except RuntimeError as exc:
+      if "WebAssembly stack switching not supported" in str(exc):
+        raise RuntimeError(
+          "This browser/runtime does not support WebAssembly stack switching, which Snakemake requires in Pyodide. Please use a recent desktop Chrome/Edge/Firefox."
+        ) from exc
+      raise
     return _orig_workflow_async_run(self, coro)
 
 
