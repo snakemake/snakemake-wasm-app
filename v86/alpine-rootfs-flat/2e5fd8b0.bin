@@ -1,0 +1,14 @@
+agetty
+alpine-base
+alpine-baselayout
+alpine-conf
+alpine-keys
+alpine-release
+apk-tools
+bash
+busybox
+cmatrix
+libc-utils
+linux-firmware-none
+linux-virt
+openrc
