@@ -489,7 +489,34 @@ globalThis.runSnakemakeWasmShellCommand = async (command, outputPaths, options =
         .filter((path) => path.length > 0)
     : [];
 
-  const inputFiles = inputPaths.length > 0 ? getArtifactsForPaths(inputPaths) : [];
+  const explicitInputFiles = Array.isArray(normalizedOptions?.inputFiles)
+    ? normalizedOptions.inputFiles
+        .map((file) => {
+          if (!file || typeof file !== "object") {
+            return null;
+          }
+          try {
+            return {
+              path: normalizeRelativePath(file.path),
+              encoding: file.encoding === "base64" ? "base64" : "utf-8",
+              content: typeof file.content === "string" ? file.content : String(file.content ?? ""),
+            };
+          } catch {
+            return null;
+          }
+        })
+        .filter(Boolean)
+    : [];
+
+  const artifactInputFiles = inputPaths.length > 0 ? getArtifactsForPaths(inputPaths) : [];
+  const inputFilesByPath = new Map();
+  for (const file of artifactInputFiles) {
+    inputFilesByPath.set(file.path, file);
+  }
+  for (const file of explicitInputFiles) {
+    inputFilesByPath.set(file.path, file);
+  }
+  const inputFiles = Array.from(inputFilesByPath.values());
 
   return runShellCommandViaHost(String(command ?? ""), outputPaths, timeoutMs, {
     slotId,
@@ -589,6 +616,29 @@ await micropip.install("snakemake", deps=True)
   }
 }
 
+async function loadPackagesForCode(pyodide, code, label = "code") {
+  const importScanCode = String(code ?? "");
+  if (!importScanCode.trim()) return;
+
+  try {
+    postLog(`Resolving Python imports with pyodide.loadPackagesFromImports (${label})`);
+    await pyodide.loadPackagesFromImports(importScanCode, {
+      messageCallback: (message) => {
+        postLog(`Import resolution progress (${label}): ${String(message ?? "")}`);
+      },
+      errorCallback: (message) => {
+        postLog(`Import resolution warning (${label}): ${String(message ?? "")}`);
+      },
+      checkIntegrity: true,
+    });
+    postLog(`Import-based package resolution complete (${label})`);
+  } catch (error) {
+    postLog(
+      `Import-based package resolution warning (${label}): ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
+
 function normalizeFiles(files) {
   if (!Array.isArray(files)) {
     return [];
@@ -611,6 +661,11 @@ function normalizeFiles(files) {
 }
 
 async function runWorkflow(pyodide, snakefileText, files, configYaml, parallelJobs) {
+  const resolveImportsForCodeChunk = async (code, label = "code") => {
+    await loadPackagesForCode(pyodide, code, String(label ?? "code"));
+  };
+
+  pyodide.globals.set("_resolve_imports_for_code_chunk", resolveImportsForCodeChunk);
   pyodide.globals.set("_snakefile_text", snakefileText);
   pyodide.globals.set("_worker_input_files", files);
   pyodide.globals.set("_workflow_config_yaml", configYaml);
@@ -619,6 +674,7 @@ async function runWorkflow(pyodide, snakefileText, files, configYaml, parallelJo
   const resultJson = await pyodide.runPythonAsync(`
 import asyncio
 import json
+import runpy
 import sys
 from pathlib import Path
 import inspect
@@ -667,6 +723,26 @@ except Exception:
 
 print("Python version:", sys.version)
 
+def _ensure_import_packages_from_code(code_text, label):
+  source = str(code_text or "")
+  if not source.strip():
+    return
+
+  try:
+    resolver = _resolve_imports_for_code_chunk
+  except Exception as resolver_lookup_error:
+    print(f"Import resolver unavailable ({label}): {resolver_lookup_error}")
+    return
+
+  async def _resolve_imports_async():
+    await resolver(source, str(label))
+
+  try:
+    loop = asyncio.get_running_loop()
+    loop.run_until_complete(_resolve_imports_async())
+  except Exception as resolver_error:
+    print(f"Import-based package resolution warning ({label}): {resolver_error}")
+
 _orig_common_async_run = snakemake.common.async_run
 _orig_workflow_async_run = snakemake.workflow.Workflow.async_run
 
@@ -688,6 +764,166 @@ def _pyodide_workflow_async_run(self, coro):
 snakemake.common.async_run = _pyodide_async_run
 snakemake.workflow.Workflow.async_run = _pyodide_workflow_async_run
 
+try:
+  import snakemake.executors.local as _snakemake_local_executor
+
+  _orig_local_run_wrapper = _snakemake_local_executor.run_wrapper
+  _run_wrapper_signature = inspect.signature(_orig_local_run_wrapper)
+
+  def _pyodide_run_wrapper(*args, **kwargs):
+    try:
+      bound_args = _run_wrapper_signature.bind_partial(*args, **kwargs)
+      run_callable = bound_args.arguments.get("run")
+      if callable(run_callable):
+        run_label = f"run:{getattr(run_callable, '__name__', 'callable')}"
+        try:
+          run_source = inspect.getsource(run_callable)
+          _ensure_import_packages_from_code(run_source, run_label)
+        except Exception as run_source_error:
+          print(f"Run source import scan warning ({run_label}): {run_source_error}")
+    except Exception as run_wrapper_patch_error:
+      print(f"run_wrapper import hook warning: {run_wrapper_patch_error}")
+
+    return _orig_local_run_wrapper(*args, **kwargs)
+
+  _snakemake_local_executor.run_wrapper = _pyodide_run_wrapper
+  print("Patched snakemake run_wrapper import resolver for emscripten")
+except Exception as _run_wrapper_patch_error:
+  print(f"run_wrapper import resolver patch unavailable: {_run_wrapper_patch_error}")
+
+try:
+  import snakemake.script as _snakemake_script
+
+  _orig_python_execute_script = _snakemake_script.PythonScript.execute_script
+  _orig_bash_execute_script = _snakemake_script.BashScript.execute_script
+
+  def _pyodide_python_execute_script(self, fname, edit=False, *args, **kwargs):
+    if sys.platform != "emscripten":
+      return _orig_python_execute_script(self, fname, edit=edit, *args, **kwargs)
+
+    try:
+      import os
+
+      os.environ["MPLBACKEND"] = "Agg"
+      import matplotlib
+
+      matplotlib.use("Agg", force=True)
+    except Exception as matplotlib_backend_error:
+      print(f"Matplotlib backend setup warning: {matplotlib_backend_error}")
+
+    script_path = Path(str(fname))
+    if not script_path.exists():
+      raise FileNotFoundError(f"Python script not found: {script_path}")
+
+    script_parent = str(script_path.parent.resolve())
+    if script_parent not in sys.path:
+      sys.path.insert(0, script_parent)
+
+    try:
+      script_source = script_path.read_text(encoding="utf-8")
+      _ensure_import_packages_from_code(script_source, f"script:{script_path.as_posix()}")
+    except Exception as script_import_error:
+      print(f"Script import scan warning ({script_path.as_posix()}): {script_import_error}")
+
+    return runpy.run_path(str(script_path), run_name="__main__")
+
+  def _pyodide_bash_execute_script(self, fname, edit=False, *args, **kwargs):
+    if sys.platform != "emscripten":
+      return _orig_bash_execute_script(self, fname, edit=edit, *args, **kwargs)
+
+    script_path = Path(str(fname))
+    if not script_path.exists():
+      raise FileNotFoundError(f"Bash script not found: {script_path}")
+
+    output_paths = []
+    try:
+      output_paths = [str(path) for path in getattr(self, "output", []) if str(path)]
+    except Exception:
+      output_paths = []
+
+    input_paths = []
+    try:
+      input_paths = [str(path) for path in getattr(self, "input", []) if str(path)]
+    except Exception:
+      input_paths = []
+
+    try:
+      script_source = script_path.read_text(encoding="utf-8")
+    except Exception:
+      script_source = script_path.read_bytes().decode("utf-8", errors="replace")
+
+    import base64 as _base64
+
+    script_source_b64 = _base64.b64encode(script_source.encode("utf-8")).decode("ascii")
+    command = f"printf '%s' '{script_source_b64}' | base64 -d | bash -se"
+
+    from js import runSnakemakeWasmShellCommand
+
+    async def _run_bash_script_async():
+      return await runSnakemakeWasmShellCommand(
+        command,
+        output_paths,
+        {
+          "timeoutMs": 300000,
+          "inputPaths": input_paths,
+        },
+      )
+
+    loop = asyncio.get_running_loop()
+    result = loop.run_until_complete(_run_bash_script_async())
+
+    if hasattr(result, "to_py"):
+      result = result.to_py()
+
+    exit_code = 0
+    stderr = ""
+    stdout = ""
+    if isinstance(result, dict):
+      try:
+        exit_code = int(result.get("exitCode", 0) or 0)
+      except Exception:
+        exit_code = 0
+      stderr = str(result.get("stderr", "") or "")
+      stdout = str(result.get("stdout", "") or "")
+
+    if exit_code != 0:
+      raise RuntimeError(
+        f"Bash script failed in v86 (exit {exit_code}): {stderr or stdout or command}"
+      )
+
+    if isinstance(result, dict):
+      for file_entry in result.get("files", []):
+        if not isinstance(file_entry, dict):
+          continue
+
+        rel_path = str(file_entry.get("path", "")).strip()
+        if not rel_path:
+          continue
+        if rel_path.startswith("/") or ".." in rel_path:
+          raise RuntimeError(f"Rejected unsafe bash output path: {rel_path!r}")
+
+        out_path = Path(rel_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        encoding = str(file_entry.get("encoding", "base64"))
+        if encoding == "base64":
+          payload = str(file_entry.get("base64", ""))
+          out_path.write_bytes(_base64.b64decode(payload))
+        elif encoding == "utf-8":
+          out_path.write_text(str(file_entry.get("text", "")), encoding="utf-8")
+        else:
+          raise RuntimeError(
+            f"Unsupported bash output encoding {encoding!r} for {rel_path!r}"
+          )
+
+    return result
+
+  _snakemake_script.PythonScript.execute_script = _pyodide_python_execute_script
+  _snakemake_script.BashScript.execute_script = _pyodide_bash_execute_script
+  print("Patched snakemake PythonScript.execute_script for emscripten")
+except Exception as _script_patch_error:
+  print(f"Python script execution patch unavailable: {_script_patch_error}")
+
 for file_spec in worker_input_files:
   file_spec = _as_python(file_spec)
   if not isinstance(file_spec, dict):
@@ -708,6 +944,7 @@ for file_spec in worker_input_files:
 
 Path("Snakefile").write_text(_snakefile_text, encoding="utf-8")
 print("Snakefile written")
+_ensure_import_packages_from_code(_snakefile_text, "Snakefile")
 config_yaml_text = str(workflow_config_yaml)
 config_yaml_has_values = any(
   line.strip() and not line.lstrip().startswith("#")
@@ -779,24 +1016,21 @@ with SnakemakeApi(
     dag_api = workflow_api.dag(
         dag_settings=DAGSettings(),
     )
-    try:
-      ok = dag_api.execute_workflow(
-          executor="wasm",
-          execution_settings=ExecutionSettings(),
-        scheduling_settings=SchedulingSettings(scheduler="greedy"),
-        scheduler_settings=GreedySchedulerSettings(
-          greediness=1.0,
-          omit_prioritize_by_temp_and_input=False,
-        ),
-        greedy_scheduler_settings=GreedySchedulerSettings(
-          greediness=1.0,
-          omit_prioritize_by_temp_and_input=False,
-        ),
-          executor_settings=_build_executor_settings(),
-          updated_files=updated_files,
-      )
-    except Exception as e:
-      ok = False
+    ok = dag_api.execute_workflow(
+        executor="wasm",
+        execution_settings=ExecutionSettings(),
+      scheduling_settings=SchedulingSettings(scheduler="greedy"),
+      scheduler_settings=GreedySchedulerSettings(
+        greediness=1.0,
+        omit_prioritize_by_temp_and_input=False,
+      ),
+      greedy_scheduler_settings=GreedySchedulerSettings(
+        greediness=1.0,
+        omit_prioritize_by_temp_and_input=False,
+      ),
+        executor_settings=_build_executor_settings(),
+        updated_files=updated_files,
+    )
 
     status["run_ok"] = ok
 status["written_files"] = [
@@ -839,6 +1073,7 @@ status["max_parallel_jobs"] = worker_max_parallel_jobs
 json.dumps(status)
 `);
 
+  pyodide.globals.delete("_resolve_imports_for_code_chunk");
   pyodide.globals.delete("_snakefile_text");
   pyodide.globals.delete("_worker_input_files");
   pyodide.globals.delete("_workflow_config_yaml");
@@ -962,6 +1197,8 @@ const handleWorkerMessage = (event) => {
       }
 
       await ensureRuntime(pyodide, wheels);
+
+      await loadPackagesForCode(pyodide, snakefile, "Snakefile");
 
       if (cancelled) {
         throw new Error("Run cancelled before workflow execution");

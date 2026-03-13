@@ -660,11 +660,7 @@ class Executor(RealExecutor):
                     shell_jobs.append((job_info, job))
                     continue
 
-                if not getattr(job, "is_run", False):
-                    if self._rule_has_directive_action(job):
-                        raise WorkflowError(
-                            f"wasm executor supports only run: rules in this mode, got directive-based rule {job.rule.name!r}"
-                        )
+                if not getattr(job, "is_run", False) and not self._rule_has_directive_action(job):
                     self.report_job_success(job_info)
                     continue
 
@@ -733,11 +729,7 @@ class Executor(RealExecutor):
                 self._async_shell_jobs[external_job_id] = job_info
                 return
 
-            if not getattr(job, "is_run", False):
-                if self._rule_has_directive_action(job):
-                    raise WorkflowError(
-                        f"wasm executor supports only run: rules in this mode, got directive-based rule {job.rule.name!r}"
-                    )
+            if not getattr(job, "is_run", False) and not self._rule_has_directive_action(job):
                 self.report_job_success(job_info)
                 return
 
