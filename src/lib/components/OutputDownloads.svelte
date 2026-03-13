@@ -50,7 +50,14 @@
 				{@const downloadName = resolved ? getDownloadFileName(resolved.label) : 'download.bin'}
 				{#if resolved}
 					<div class="flex items-center gap-2 border border-slate-200 px-2 py-1 text-xs text-slate-700 hover:bg-slate-100">
-						<p class="min-w-0 flex-1 truncate">{resolved.label}</p>
+						<a
+							href={resolved.href}
+							target="_blank"
+							rel="noopener noreferrer"
+							class="min-w-0 flex-1 truncate text-green-700 hover:underline"
+						>
+							{resolved.label}
+						</a>
 						<p class="text-slate-500">{sizeLabel}</p>
 						<a
 							href={resolved.href}
