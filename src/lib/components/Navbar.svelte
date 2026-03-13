@@ -79,5 +79,8 @@
 				<span class={title ? 'text-slate-900' : 'text-slate-500'}>{title || TITLE_PLACEHOLDER}</span>
 			</button>
 		{/if}
+		<a href="https://github.com/snakemake/snakemake-wasm-app" target="_blank" rel="noopener noreferrer" class="text-slate-500 hover:text-slate-900 text-sm">
+			GitHub
+		</a>
 	</div>
 </nav>
