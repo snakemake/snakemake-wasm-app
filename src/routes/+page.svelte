@@ -151,6 +151,9 @@
 
 	const IDE_STATE_HASH_KEY = 'code';
 	const RUNTIME_FILES_PARAM_KEY = 'runtimefiles';
+	const WORKFLOW_TITLE_PARAM_KEY = 'title';
+
+	let workflowTitle = '';
 
 	const toBase64Url = (input: string): string =>
 		input.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
@@ -249,6 +252,31 @@
 			persistIdeStateToUrl();
 			ideUrlPersistTimer = null;
 		}, 250);
+	};
+
+	const applyWorkflowTitleFromUrl = () => {
+		const searchParams = new URLSearchParams(window.location.search);
+		workflowTitle = (searchParams.get(WORKFLOW_TITLE_PARAM_KEY) ?? '').trim();
+	};
+
+	const persistWorkflowTitleToUrl = (nextTitle: string) => {
+		const searchParams = new URLSearchParams(window.location.search);
+		const trimmedTitle = String(nextTitle ?? '').trim();
+
+		if (trimmedTitle) {
+			searchParams.set(WORKFLOW_TITLE_PARAM_KEY, trimmedTitle);
+		} else {
+			searchParams.delete(WORKFLOW_TITLE_PARAM_KEY);
+		}
+
+		const nextSearch = searchParams.toString();
+		const nextUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ''}${window.location.hash}`;
+		window.history.replaceState(window.history.state, '', nextUrl);
+	};
+
+	const setWorkflowTitle = (nextTitle: string) => {
+		workflowTitle = String(nextTitle ?? '').trim();
+		persistWorkflowTitleToUrl(workflowTitle);
 	};
 
 	const appendLog = (...parts: unknown[]) => {
@@ -473,23 +501,64 @@
 		setupWorker();
 	};
 
+	const inferOutputMimeType = (path: string, fallback: string): string => {
+		const normalized = String(path ?? '').trim().toLowerCase();
+		const extension = normalized.includes('.') ? normalized.slice(normalized.lastIndexOf('.') + 1) : '';
+
+		switch (extension) {
+			case 'txt':
+			case 'log':
+			case 'md':
+				return 'text/plain;charset=utf-8';
+			case 'csv':
+				return 'text/csv;charset=utf-8';
+			case 'tsv':
+				return 'text/tab-separated-values;charset=utf-8';
+			case 'json':
+				return 'application/json;charset=utf-8';
+			case 'yaml':
+			case 'yml':
+				return 'application/yaml;charset=utf-8';
+			case 'html':
+			case 'htm':
+				return 'text/html;charset=utf-8';
+			case 'svg':
+				return 'image/svg+xml';
+			case 'png':
+				return 'image/png';
+			case 'jpg':
+			case 'jpeg':
+				return 'image/jpeg';
+			case 'gif':
+				return 'image/gif';
+			case 'webp':
+				return 'image/webp';
+			case 'pdf':
+				return 'application/pdf';
+			default:
+				return fallback;
+		}
+	};
+
 	const toDownloadUrl = (file: OutputFilePayload): { href: string; label: string } | null => {
+		const label = String(file.path ?? '');
 		let blob: Blob | null = null;
 		if (file.encoding === 'utf-8') {
-			blob = new Blob([String(file.text ?? '')], { type: 'text/plain;charset=utf-8' });
+			blob = new Blob([String(file.text ?? '')], {
+				type: inferOutputMimeType(label, 'text/plain;charset=utf-8')
+			});
 		} else if (file.encoding === 'base64') {
 			const bytes = base64ToBytes(String(file.base64 ?? ''));
 			const arrayBuffer = bytes.buffer.slice(
 				bytes.byteOffset,
 				bytes.byteOffset + bytes.byteLength
 			) as ArrayBuffer;
-			blob = new Blob([arrayBuffer], { type: 'application/octet-stream' });
+			blob = new Blob([arrayBuffer], { type: inferOutputMimeType(label, 'application/octet-stream') });
 		}
 
 		if (!blob) return null;
 		const href = URL.createObjectURL(blob);
 		outputUrls.push(href);
-		const label = file.path;
 		return { href, label };
 	};
 
@@ -895,6 +964,7 @@
 	$: tabs, activeTabId, scheduleIdeStatePersist();
 
 	onMount(() => {
+		applyWorkflowTitleFromUrl();
 		setupWorker();
 		const restoredFromUrl = applyIdeStateFromUrl();
 		ideUrlSyncReady = true;
@@ -958,7 +1028,7 @@
 </script>
 
 <div class="h-dvh w-full overflow-hidden flex flex-col">
-	<Navbar />
+	<Navbar title={workflowTitle} onTitleChange={setWorkflowTitle} />
 
 	<main class="w-full flex-1 min-h-0 px-4 py-4 overflow-hidden">
 	<div class="grid grid-cols-1 gap-4 lg:h-full xl:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
