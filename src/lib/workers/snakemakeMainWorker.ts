@@ -601,7 +601,7 @@ del _worker_wheels
     postLog("Installing snakemake (with dependencies)");
     await pyodide.runPythonAsync(`
 import micropip
-await micropip.install("snakemake", deps=True)
+await micropip.install("snakemake==9.16.3", deps=True)
 `);
     postLog("snakemake installation complete");
 
