@@ -23,3 +23,12 @@ vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 
 .vscode
+
+# Embedded plugin (Python) artifacts
+snakemake-executor-plugin-wasm/.pixi/
+snakemake-executor-plugin-wasm/dist/
+snakemake-executor-plugin-wasm/**/__pycache__/
+snakemake-executor-plugin-wasm/**/*.py[cod]
+snakemake-executor-plugin-wasm/.pytest_cache/
+snakemake-executor-plugin-wasm/.coverage
+snakemake-executor-plugin-wasm/coverage-report/

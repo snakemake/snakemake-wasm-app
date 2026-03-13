@@ -2,6 +2,7 @@
 	export interface RuntimeFileItem {
 		path: string;
 		sizeBytes: number;
+		sourceUrl?: string;
 	}
 
 	let {
@@ -36,7 +37,19 @@
 			<div class="flex flex-wrap gap-1">
 				{#each files as file}
 					<div class="inline-flex items-center gap-1 border border-slate-200 px-2 py-1 text-xs text-slate-700">
-						<p class="max-w-44 truncate">{file.path}</p>
+						{#if file.sourceUrl}
+							<a
+								href={file.sourceUrl}
+								target="_blank"
+								rel="noopener noreferrer"
+								class="max-w-44 truncate text-green-700 hover:underline"
+								title={file.sourceUrl}
+							>
+								{file.path}
+							</a>
+						{:else}
+							<p class="max-w-44 truncate">{file.path}</p>
+						{/if}
 						<p class="text-slate-500">{formatSize(file.sizeBytes)}</p>
 						<button
 							type="button"

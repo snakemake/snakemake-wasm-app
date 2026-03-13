@@ -4,6 +4,7 @@
 	import { Tabs } from '@skeletonlabs/skeleton-svelte';
 	import IdeTabs from '$lib/components/IdeTabs.svelte';
 	import type { IdeTabItem } from '$lib/components/IdeTabs.svelte';
+	import Navbar from '$lib/components/Navbar.svelte';
 	import RuntimeFiles from '$lib/components/RuntimeFiles.svelte';
 	import type { RuntimeFileItem } from '$lib/components/RuntimeFiles.svelte';
 	import RunControls from '$lib/components/RunControls.svelte';
@@ -35,11 +36,20 @@
 		| { type: 'log'; text: string }
 		| { type: 'progress'; payload: Record<string, unknown> }
 		| { type: 'result'; payload: WorkflowResultPayload }
-		| { type: 'shell-run-request'; requestId: string; command: string; timeoutMs?: number; outputPaths?: string[] }
+		| {
+				type: 'shell-run-request';
+				requestId: string;
+				workerSessionId?: string;
+				command: string;
+				timeoutMs?: number;
+				outputPaths?: string[];
+				inputFiles?: InputFilePayload[];
+				slotId?: number;
+		  }
 		| { type: 'error'; error: string };
 
 	type WorkerOutMessage =
-		| { type: 'init'; wheels: string[]; pyodideIndexUrl: string }
+		| { type: 'init'; wheels: string[]; pyodideIndexUrl: string; maxParallelJobs?: number }
 		| {
 				type: 'run';
 				snakefile: string;
@@ -47,11 +57,13 @@
 				files: InputFilePayload[];
 				wheels: string[];
 				pyodideIndexUrl: string;
+				maxParallelJobs?: number;
 		  }
 		| { type: 'cancel' }
 		| {
 				type: 'shell-run-response';
 				requestId: string;
+				workerSessionId?: string;
 				ok: boolean;
 				stdout?: string;
 				stderr?: string;
@@ -67,8 +79,18 @@
 	};
 
 	const PYODIDE_INDEX_URL = withBase('/pyodide/');
+	const PLUGIN_WHEEL_FILE = 'snakemake_executor_plugin_wasm-0.1.0-py3-none-any.whl';
+	const PLUGIN_WHEEL_CACHE_BUST = `v=${Date.now().toString(36)}`;
+	const MAX_CONCURRENT_SHELL_JOBS = 3;
+	const DEFAULT_MAX_PARALLEL_JOBS = 1;
 
-	const runtimeWheelUrls = RUNTIME_WHEELS.map((wheelPath) => withBase(wheelPath));
+	const runtimeWheelUrls = RUNTIME_WHEELS.map((wheelPath) => {
+		const url = withBase(wheelPath);
+		if (!wheelPath.endsWith(PLUGIN_WHEEL_FILE)) {
+			return url;
+		}
+		return `${url}${url.includes('?') ? '&' : '?'}${PLUGIN_WHEEL_CACHE_BUST}`;
+	});
 
 	const v86Config = {
 		wasmPath: withBase('/v86/v86.wasm'),
@@ -109,10 +131,11 @@
 		{ id: createId(), path: 'config.yaml', content: DEFAULT_CONFIG }
 	];
 	let activeTabId = tabs[0]?.id ?? '';
-	const uploadedFiles = new Map<string, { payload: InputFilePayload; sizeBytes: number }>();
+	const uploadedFiles = new Map<string, { payload: InputFilePayload; sizeBytes: number; sourceUrl?: string }>();
 	let runtimeFiles: RuntimeFileItem[] = [];
 	let outputUrls: string[] = [];
 	let runtimeSupportMessage: string | null = null;
+	let maxParallelJobs = DEFAULT_MAX_PARALLEL_JOBS;
 
 	let worker: Worker | null = null;
 	let workerRuntimeReady = false;
@@ -123,7 +146,8 @@
 	let ideUrlSyncReady = false;
 	let ideUrlPersistTimer: ReturnType<typeof setTimeout> | null = null;
 
-	let v86Shell: V86Shell | null = null;
+	const v86ShellPool = new Map<number, V86Shell>();
+	const v86ShellInitInFlight = new Map<number, Promise<V86Shell>>();
 
 	const IDE_STATE_HASH_KEY = 'code';
 	const RUNTIME_FILES_PARAM_KEY = 'runtimefiles';
@@ -235,6 +259,21 @@
 		console.log(...parts);
 	};
 
+	const getWorkerSettingMax = (): number => {
+		if (typeof navigator === 'undefined') return 16;
+		return Math.max(1, Math.min(16, navigator.hardwareConcurrency ?? 8));
+	};
+
+	const clampWorkerCount = (value: number): number => {
+		const maxWorkers = getWorkerSettingMax();
+		if (!Number.isFinite(value)) return 1;
+		return Math.max(1, Math.min(maxWorkers, Math.floor(value)));
+	};
+
+	const setWorkerCount = (rawValue: string) => {
+		maxParallelJobs = clampWorkerCount(Number(rawValue));
+	};
+
 	const toRuntimeSupportMessage = (errorText: string): string | null => {
 		if (!errorText) return null;
 		if (errorText.includes('can_run_sync')) {
@@ -254,7 +293,7 @@
 
 	const refreshUploadedFilePaths = () => {
 		runtimeFiles = [...uploadedFiles.entries()]
-			.map(([path, entry]) => ({ path, sizeBytes: entry.sizeBytes }))
+			.map(([path, entry]) => ({ path, sizeBytes: entry.sizeBytes, sourceUrl: entry.sourceUrl }))
 			.sort((a, b) => a.path.localeCompare(b.path));
 	};
 
@@ -288,7 +327,8 @@
 					encoding: 'base64',
 					content: bytesToBase64(bytes)
 				},
-				sizeBytes: bytes.length
+				sizeBytes: bytes.length,
+				sourceUrl: undefined
 			});
 		}
 
@@ -352,7 +392,8 @@
 						encoding: 'base64',
 						content: bytesToBase64(bytes)
 					},
-					sizeBytes: bytes.length
+					sizeBytes: bytes.length,
+					sourceUrl: parsedUrl.toString()
 				});
 				addedCount += 1;
 				appendLog('[ui] runtimefiles: loaded', parsedUrl.toString(), `-> ${finalPath}`);
@@ -418,6 +459,18 @@
 		workerRuntimeInitInFlight = null;
 		workerRuntimeInitResolve = null;
 		workerRuntimeInitReject = null;
+	};
+
+	const restartWorkerForRun = () => {
+		appendLog('[ui] restartWorkerForRun: resetting worker/runtime state');
+		workerRuntimeReady = false;
+		workerInitSupported = true;
+		resetWorkerRuntimeInitLatch();
+		if (worker) {
+			worker.terminate();
+			worker = null;
+		}
+		setupWorker();
 	};
 
 	const toDownloadUrl = (file: OutputFilePayload): { href: string; label: string } | null => {
@@ -520,17 +573,91 @@
 		}
 	};
 
-	const ensureShell = async (): Promise<V86Shell> => {
-		if (v86Shell) return v86Shell;
-		await ensureV86ScriptLoaded(withBase('/thirdparty/v86/libv86.js'));
-		v86Shell = new V86Shell({
-			...v86Config,
-			terminalEl: terminalElement,
-			onLog: (message) => appendLog('[v86]', message)
-		});
-		await v86Shell.init();
-		shellReady = true;
-		return v86Shell;
+	const ensureShell = async (slotId = 0): Promise<V86Shell> => {
+		appendLog('[ui] ensureShell: requested', { slotId, hasExisting: v86ShellPool.has(slotId), hasInFlight: v86ShellInitInFlight.has(slotId) });
+		const existing = v86ShellPool.get(slotId);
+		if (existing) {
+			appendLog('[ui] ensureShell: reusing existing shell', { slotId });
+			return existing;
+		}
+
+		const inFlight = v86ShellInitInFlight.get(slotId);
+		if (inFlight) {
+			appendLog('[ui] ensureShell: awaiting in-flight init', { slotId });
+			return inFlight;
+		}
+
+		const initPromise = (async () => {
+			appendLog('[ui] ensureShell: loading v86 script', { slotId });
+			await ensureV86ScriptLoaded(withBase('/thirdparty/v86/libv86.js'));
+			appendLog('[ui] ensureShell: v86 script loaded', { slotId });
+
+			appendLog('[ui] ensureShell: creating V86Shell instance', { slotId, hasTerminalEl: slotId === 0 ? Boolean(terminalElement) : false });
+			const shell = new V86Shell({
+				...v86Config,
+				terminalEl: slotId === 0 ? terminalElement : null,
+				onLog: (message) => appendLog(`[v86:${slotId}]`, message)
+			});
+			appendLog('[ui] ensureShell: calling shell.init()', { slotId });
+			await shell.init();
+			appendLog('[ui] ensureShell: shell.init() resolved', { slotId });
+			v86ShellPool.set(slotId, shell);
+			shellReady = true;
+			appendLog('[ui] ensureShell: shell stored and ready', { slotId, poolSize: v86ShellPool.size });
+			return shell;
+		})();
+
+		v86ShellInitInFlight.set(slotId, initPromise);
+		appendLog('[ui] ensureShell: init promise stored', { slotId, inFlightSize: v86ShellInitInFlight.size });
+		try {
+			const shell = await initPromise;
+			appendLog('[ui] ensureShell: returning initialized shell', { slotId });
+			return shell;
+		} finally {
+			v86ShellInitInFlight.delete(slotId);
+			appendLog('[ui] ensureShell: cleared in-flight marker', { slotId, inFlightSize: v86ShellInitInFlight.size });
+		}
+	};
+
+	const syncShellInputFiles = async (shell: V86Shell, inputFiles: InputFilePayload[]): Promise<void> => {
+		for (const inputFile of inputFiles) {
+			const vmPath = normalizeVmOutputPath(inputFile.path);
+			if (!vmPath) continue;
+
+			try {
+				if (inputFile.encoding === 'base64') {
+					await shell.writeFile(vmPath, base64ToBytes(String(inputFile.content ?? '')));
+				} else {
+					await shell.writeFile(vmPath, new TextEncoder().encode(String(inputFile.content ?? '')));
+				}
+			} catch (error) {
+				appendLog('[shell] failed to sync input', inputFile.path, String(error));
+				throw error;
+			}
+		}
+	};
+
+	const ensureShellOutputDirectories = async (shell: V86Shell, outputPaths: string[]): Promise<void> => {
+		const directories = new Set<string>();
+		for (const outputPath of outputPaths) {
+			const vmPath = normalizeVmOutputPath(outputPath);
+			if (!vmPath) continue;
+			const slashIndex = vmPath.lastIndexOf('/');
+			if (slashIndex <= 0) continue;
+			const directory = vmPath.slice(0, slashIndex).trim();
+			if (!directory || directory === '/root') continue;
+			directories.add(directory);
+		}
+
+		for (const directory of directories) {
+			try {
+				await shell.ensureDirectory(directory);
+				appendLog('[shell] ensured output directory', directory);
+			} catch (error) {
+				appendLog('[shell] failed to ensure output directory', directory, String(error));
+				throw error;
+			}
+		}
 	};
 
 	const collectShellOutputFiles = async (shell: V86Shell, outputPaths: string[]): Promise<ShellSyncedFile[]> => {
@@ -565,7 +692,8 @@
 		worker.postMessage({
 			type: 'init',
 			wheels: runtimeWheelUrls,
-			pyodideIndexUrl: PYODIDE_INDEX_URL
+			pyodideIndexUrl: PYODIDE_INDEX_URL,
+			maxParallelJobs
 		} satisfies WorkerOutMessage);
 
 		return workerRuntimeInitInFlight;
@@ -575,6 +703,7 @@
 		worker = new Worker(new URL('../lib/workers/snakemakeMainWorker.ts', import.meta.url), {
 			type: 'module'
 		});
+		const sourceWorker = worker;
 
 		worker.onmessage = async (event: MessageEvent<WorkerInMessage>) => {
 			const msg = event.data;
@@ -617,31 +746,49 @@
 			}
 			if (msg.type === 'shell-run-request') {
 				const requestId = String(msg.requestId ?? '');
+				const workerSessionId = String(msg.workerSessionId ?? '');
 				const command = String(msg.command ?? '');
 				const outputPaths = Array.isArray(msg.outputPaths) ? msg.outputPaths : [];
-				appendLog('[shell] request', requestId, command);
+				const inputFiles = Array.isArray(msg.inputFiles) ? msg.inputFiles : [];
+				const slotId = Number.isFinite(msg.slotId) ? Math.max(0, Math.floor(Number(msg.slotId))) : 0;
+				appendLog('[shell] request', requestId, { workerSessionId, slotId, command });
 
 				try {
-					const shell = await ensureShell();
+					const shell = await ensureShell(slotId);
+					await syncShellInputFiles(shell, inputFiles);
+					await ensureShellOutputDirectories(shell, outputPaths);
 					const result = await shell.run(command, { timeoutMs: Number(msg.timeoutMs ?? 300000) });
 					const syncedFiles = await collectShellOutputFiles(shell, outputPaths);
-					worker?.postMessage({
+					sourceWorker.postMessage({
 						type: 'shell-run-response',
 						requestId,
+						workerSessionId,
 						ok: true,
 						stdout: result.stdout,
 						stderr: result.stderr,
 						exitCode: result.exitCode,
 						files: syncedFiles
 					} satisfies WorkerOutMessage);
+					appendLog('[shell] response posted', requestId, {
+						ok: true,
+						files: syncedFiles.length,
+						workerSessionId,
+						workerMatchesGlobal: sourceWorker === worker
+					});
 					appendLog('[shell] success', requestId, `exit=${result.exitCode}`);
 				} catch (error) {
-					worker?.postMessage({
+					sourceWorker.postMessage({
 						type: 'shell-run-response',
 						requestId,
+						workerSessionId,
 						ok: false,
 						error: String(error)
 					} satisfies WorkerOutMessage);
+					appendLog('[shell] response posted', requestId, {
+						ok: false,
+						workerSessionId,
+						workerMatchesGlobal: sourceWorker === worker
+					});
 					appendLog('[shell] error', requestId, String(error));
 				}
 				return;
@@ -673,6 +820,7 @@
 	};
 
 	const runWorkflow = async () => {
+		restartWorkerForRun();
 		if (!worker) return;
 		const runInputs = buildRunInputsFromTabs();
 		if (!runInputs) return;
@@ -684,9 +832,28 @@
 		clearOutputUrls();
 
 		try {
+			appendLog('[ui] runWorkflow: prewarmWorkerRuntime start');
 			await prewarmWorkerRuntime();
+			appendLog('[ui] runWorkflow: prewarmWorkerRuntime done');
 			appendLog('[ui] ensuring shell is ready before run');
+			appendLog('[ui] runWorkflow: ensureShell start', { slotId: 0 });
 			await ensureShell();
+			appendLog('[ui] runWorkflow: ensureShell done', { slotId: 0 });
+
+			const effectiveShellParallel = Math.max(1, Math.min(MAX_CONCURRENT_SHELL_JOBS, maxParallelJobs));
+			if (effectiveShellParallel > 1) {
+				appendLog('[ui] runWorkflow: prewarming shell slots', {
+					effectiveShellParallel,
+				});
+				const warmups: Promise<V86Shell>[] = [];
+				for (let slotId = 1; slotId < effectiveShellParallel; slotId += 1) {
+					warmups.push(ensureShell(slotId));
+				}
+				await Promise.all(warmups);
+				appendLog('[ui] runWorkflow: shell slot prewarm complete', {
+					effectiveShellParallel,
+				});
+			}
 		} catch (error) {
 			appendLog('[error]', String(error));
 			isRunning = false;
@@ -707,8 +874,14 @@
 			configYaml: runInputs.configYaml,
 			files: runInputs.files,
 			wheels: runtimeWheelUrls,
-			pyodideIndexUrl: PYODIDE_INDEX_URL
+			pyodideIndexUrl: PYODIDE_INDEX_URL,
+			maxParallelJobs
 		} satisfies WorkerOutMessage);
+		appendLog('[ui] runWorkflow: worker.postMessage(run) sent', {
+			filesCount: runInputs.files.length,
+			runtimeFileCount: runInputs.runtimeFileCount,
+			maxParallelJobs
+		});
 
 		appendLog('[ui] run requested', workerRuntimeReady ? '(runtime prewarmed)' : '(runtime initializing)');
 	};
@@ -746,6 +919,7 @@
 
 			await ingestRuntimeFilesFromUrlParams();
 
+			appendLog('[ui] onMount: starting shell prewarm');
 			ensureShell()
 				.then(() => appendLog('[v86] prewarm: ready'))
 				.catch((error) => appendLog('[v86] prewarm failed', String(error)));
@@ -773,12 +947,20 @@
 
 	onDestroy(() => {
 		clearOutputUrls();
+		for (const shell of v86ShellPool.values()) {
+			shell.destroy();
+		}
+		v86ShellPool.clear();
+		v86ShellInitInFlight.clear();
 		worker?.terminate();
 		worker = null;
 	});
 </script>
 
-	<main class="w-full px-4 py-4 lg:h-screen lg:overflow-hidden">
+<div class="h-dvh w-full overflow-hidden flex flex-col">
+	<Navbar />
+
+	<main class="w-full flex-1 min-h-0 px-4 py-4 overflow-hidden">
 	<div class="grid grid-cols-1 gap-4 lg:h-full xl:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
 		<section class="min-h-0 flex flex-col gap-2 bg-slate-50">
 			<div class="min-h-0 flex-1 ">
@@ -797,7 +979,15 @@
 
 		<section class="space-y-4 min-h-0 lg:overflow-hidden lg:pr-1 lg:flex lg:flex-col">
 			<div class="border border-slate-200 bg-slate-50 p-2 lg:shrink-0 ">
-				<RunControls runDisabled={runDisabled} onRun={runWorkflow} onCancel={cancelWorkflow} onClear={clearLogs} />
+				<RunControls
+					runDisabled={runDisabled}
+					onRun={runWorkflow}
+					onCancel={cancelWorkflow}
+					onClear={clearLogs}
+					workerCount={maxParallelJobs}
+					workerCountMax={getWorkerSettingMax()}
+					onWorkerCountChange={setWorkerCount}
+				/>
 				<!-- <div class="mt-2 border border-slate-200 bg-slate-50 px-2 py-1 text-xs text-slate-600">
 					{#if isRunning}
 						Workflow status: running
@@ -829,7 +1019,8 @@
 			</div>
 		</section>
 	</div>
-</main>
+	</main>
+</div>
 
 {#if runtimeSupportMessage}
 	<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" role="alertdialog" aria-live="assertive">
@@ -839,7 +1030,7 @@
 				<button
 					type="button"
 					class="rounded border border-slate-300 px-3 py-1 text-sm text-slate-700 hover:bg-slate-50"
-					on:click={() => (runtimeSupportMessage = null)}
+					onclick={() => (runtimeSupportMessage = null)}
 				>
 					OK
 				</button>

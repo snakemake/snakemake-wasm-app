@@ -1,0 +1,44 @@
+[project]
+dependencies = [ "snakemake-interface-common>=1.23.0,<2", "snakemake-interface-executor-plugins>=9.4.0,<10",]
+name = "snakemake-executor-plugin-wasm"
+requires-python = ">=3.11,<4.0"
+version = "0.1.0"
+[[project.authors]]
+name = "Wytamma Wirth"
+email = "wytamma.wirth@me.com"
+
+[build-system]
+build-backend = "hatchling.build"
+requires = [ "hatchling",]
+
+[dependency-groups]
+dev = [ "ruff", "coverage", "pytest", "twine", "build", "snakemake",]
+
+[project.urls]
+Repository = "https://github.com/your/plugin"
+Documentation = "https://snakemake.github.io/snakemake-plugin-catalog/plugins/executor/wasm.html"
+
+[tool.pixi.workspace]
+channels = [ "conda-forge", "bioconda",]
+platforms = [ "osx-arm64",]
+
+[tool.pixi.tasks]
+
+[tool.pixi.dependencies]
+global = ">=6.6.13,<7"
+snakedeploy = "==0.16.0"
+pip = ">=26.0.1,<27"
+
+[tool.pixi.pypi-dependencies.snakemake_executor_plugin_wasm]
+path = "."
+editable = true
+
+[tool.pixi.environments.dev]
+features = [ "dev",]
+
+[tool.pixi.feature.dev.tasks]
+lint = "ruff check"
+format = "ruff format"
+test = "pytest --cov=snakemake-executor-plugin-wasm --cov-report=xml:coverage-report/coverage.xml --cov-report=term-missing tests/tests.py"
+build = "python -m build"
+check-build = { cmd = "python -m twine check dist/*", depends-on = ["build"] }
