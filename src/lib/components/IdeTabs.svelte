@@ -46,7 +46,7 @@
 	<Tabs value={activeTabId} onValueChange={(d) => onSelect(d.value)} class="flex flex-1 min-h-0 flex-col">
 
 		<!-- tab bar -->
-		<Tabs.List class="flex border-b border-slate-200 overflow-x-auto mb-0">
+		<Tabs.List class="flex border-b border-slate-200 overflow-x-auto mb-0 mt-2">
 
 			{#each tabs as tab}
 
@@ -63,7 +63,7 @@
 					onAdd();
 				}}
 				onmousedown={(e) => e.stopPropagation()}
-				class="ml-1 px-2 py-1 text-sm text-slate-600 hover:text-slate-900"
+				class="ml-1 px-2 text-sm text-slate-600 hover:text-slate-900 border border-slate-200"
 				aria-label="Add file tab"
 			>
 				+
