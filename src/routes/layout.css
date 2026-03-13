@@ -7,3 +7,24 @@
 @plugin '@tailwindcss/typography';
 
 @custom-variant dark (&:where([data-mode="dark"], [data-mode="dark"] *));
+
+:global(html),
+:global(body) {
+	margin: 0;
+	padding: 0;
+	width: 100%;
+	max-width: 100%;
+	height: 100%;
+	overflow-x: hidden;
+}
+
+:global(*),
+:global(*::before),
+:global(*::after) {
+	box-sizing: border-box;
+}
+
+:global(body > div),
+:global(body > main) {
+	max-width: 100%;
+}

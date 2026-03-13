@@ -9,6 +9,10 @@ interface V86Instance {
 		send(channel: string, payload: number): void;
 		register(event: string, listener: () => void): void;
 	};
+	fs9p?: {
+		SearchPath(path: string): { id: number; parentid: number };
+		CreateDirectory(name: string, parentId: number): void;
+	};
 	add_listener(channel: string, listener: (byte: number) => void): void;
 	create_file(path: string, data: Uint8Array): Promise<void>;
 	create_directory(path: string): Promise<void>;
@@ -124,7 +128,7 @@ export class V86Shell {
 				'rw root=host9p rootfstype=9p rootflags=trans=virtio,cache=loose modules=virtio_pci tsc=reliable',
 			bootTimeoutMs: 120000,
 			runTimeoutMs: 30000,
-			promptRegex: /(localhost|root|#|\$|❯)/i,
+			promptRegex: /(localhost|root|#|\$|❯|â¯|~\s*(?:❯|â¯|\$|#)\s*)/i,
 			startupProbeCommand: 'echo __86V_READY__',
 			...options
 		};
@@ -152,7 +156,10 @@ export class V86Shell {
 
 	async init(): Promise<this> {
 		if (this.destroyed) throw new Error('Shell has been destroyed');
-		if (this.emulator) return this;
+		if (this.emulator) {
+			this.log('init: emulator already exists, skipping re-init');
+			return this;
+		}
 
 		const globalV86 = (window as unknown as { V86?: V86Constructor }).V86;
 		const V86Ctor = this.options.V86 ?? globalV86;
@@ -184,12 +191,22 @@ export class V86Shell {
 		});
 
 		this.attachSerialListeners();
+		this.log('init: serial listeners attached');
+		this.log('init: waiting for emulator-loaded event');
 		await this.waitForEmulatorLoaded();
+		this.log('init: emulator-loaded event received');
+		this.log('init: waiting for shell prompt');
 		await this.waitForPrompt();
+		this.log('init: shell prompt detected');
 
 		if (this.options.startupProbeCommand) {
+			this.log('init: running startup probe', { command: this.options.startupProbeCommand });
 			const probe = await this.run(this.options.startupProbeCommand, {
 				timeoutMs: this.options.runTimeoutMs
+			});
+			this.log('init: startup probe completed', {
+				exitCode: probe.exitCode,
+				hasReadyMarker: probe.stdout.includes('__86V_READY__')
 			});
 			if (probe.exitCode !== 0 || !probe.stdout.includes('__86V_READY__')) {
 				throw new Error('Shell startup probe failed');
@@ -197,7 +214,9 @@ export class V86Shell {
 		}
 
 		if (this.options.initCommand) {
+			this.log('init: running initCommand', { command: this.options.initCommand });
 			await this.run(this.options.initCommand, { timeoutMs: this.options.runTimeoutMs });
+			this.log('init: initCommand completed');
 		}
 
 		this.log('init: ready');
@@ -246,7 +265,120 @@ export class V86Shell {
 	async readFile(vmPath: string): Promise<Uint8Array> {
 		if (!this.emulator) throw new Error('Shell not initialized');
 		this.assertSafePath(vmPath);
-		return await this.emulator.read_file(vmPath);
+		this.log('fs: readFile start', { vmPath });
+		const bytes = await this.emulator.read_file(vmPath);
+		this.log('fs: readFile done', { vmPath, bytes: bytes.length });
+		return bytes;
+	}
+
+	async writeFile(vmPath: string, data: Uint8Array): Promise<void> {
+		if (!this.emulator) throw new Error('Shell not initialized');
+		this.assertSafePath(vmPath);
+		this.log('fs: writeFile start', { vmPath, bytes: data.length });
+
+		const normalizedPath = vmPath.trim();
+		const rootRelativePath = normalizedPath.replace(/^\/root\//, '');
+		const noLeadingSlashPath = normalizedPath.replace(/^\/+/, '');
+		const pathCandidates = Array.from(
+			new Set([normalizedPath, noLeadingSlashPath, rootRelativePath].filter((path) => path.length > 0))
+		);
+
+		const directoryCandidates = Array.from(
+			new Set(
+				pathCandidates
+					.map((path) => path.slice(0, path.lastIndexOf('/')).trim())
+					.filter((path) => path.length > 0)
+			)
+		);
+
+		for (const directoryPath of directoryCandidates) {
+			await this.ensureDirectory(directoryPath);
+		}
+
+		let lastError: unknown = null;
+		for (const candidatePath of pathCandidates) {
+			try {
+				await this.emulator.create_file(candidatePath, data);
+				this.log('fs: writeFile done', { vmPath: candidatePath, bytes: data.length, requestedPath: vmPath });
+				return;
+			} catch (error) {
+				lastError = error;
+				this.log('fs: writeFile candidate failed', {
+					candidatePath,
+					error: String(error)
+				});
+			}
+		}
+
+		const shellPath = this.normalizeShellPath(vmPath);
+		const directory = shellPath.slice(0, shellPath.lastIndexOf('/'));
+		const encoded = this.bytesToBase64(data);
+		const mkdirPrefix = directory ? `mkdir -p ${this.shellSingleQuote(directory)} && ` : '';
+		const writeCommand = `${mkdirPrefix}printf %s ${this.shellSingleQuote(encoded)} | base64 -d > ${this.shellSingleQuote(shellPath)}`;
+
+		try {
+			this.log('fs: writeFile fallback shell start', { shellPath, bytes: data.length });
+			const result = await this.run(writeCommand, { timeoutMs: Math.max(120000, this.options.runTimeoutMs) });
+			if (result.exitCode !== 0) {
+				throw new Error(result.stdout || result.raw || `Shell fallback write failed with exit ${result.exitCode}`);
+			}
+			this.log('fs: writeFile fallback shell done', { shellPath, bytes: data.length });
+			return;
+		} catch (fallbackError) {
+			this.log('fs: writeFile fallback shell failed', { shellPath, error: String(fallbackError) });
+			throw (lastError instanceof Error
+				? lastError
+				: new Error(String(fallbackError ?? lastError ?? 'Failed to write file')));
+		}
+	}
+
+	async ensureDirectory(vmPath: string): Promise<void> {
+		if (!this.emulator) throw new Error('Shell not initialized');
+		this.assertSafePath(vmPath);
+		this.log('fs: ensureDirectory start', { vmPath });
+
+		this.ensureDirectoryViaFs9p(vmPath);
+
+		const normalizedPath = vmPath.trim();
+		const pathVariants = Array.from(
+			new Set([normalizedPath, normalizedPath.replace(/^\/+/, '')].filter((path) => path.length > 0))
+		);
+
+		for (const variantPath of pathVariants) {
+			const parts = variantPath.split('/').filter(Boolean);
+			let current = variantPath.startsWith('/') ? '' : undefined;
+
+			for (const part of parts) {
+				if (current === undefined) {
+					current = part;
+				} else if (current.length === 0) {
+					current = `/${part}`;
+				} else {
+					current = `${current}/${part}`;
+				}
+
+				try {
+					await this.emulator.create_directory(current);
+					this.log('fs: ensureDirectory created', { path: current });
+				} catch {
+					/* directory may already exist or path form unsupported */
+				}
+			}
+		}
+
+		this.log('fs: ensureDirectory done', { vmPath });
+	}
+
+	destroy(): void {
+		if (this.destroyed) return;
+		this.destroyed = true;
+		for (const pending of this.pendingRuns.values()) {
+			clearTimeout(pending.timer);
+			pending.reject(new Error('Shell destroyed'));
+		}
+		this.pendingRuns.clear();
+		this.emulator?.destroy?.();
+		this.emulator = null;
 	}
 
 	private attachSerialListeners(): void {
@@ -267,8 +399,12 @@ export class V86Shell {
 	private waitForEmulatorLoaded(): Promise<void> {
 		if (!this.emulator) return Promise.reject(new Error('Shell not initialized'));
 		return new Promise((resolve, reject) => {
-			const timer = setTimeout(() => reject(new Error('Timed out waiting for emulator-loaded')), this.options.bootTimeoutMs);
+			const timer = setTimeout(() => {
+				this.log('init: timed out waiting for emulator-loaded event', { bootTimeoutMs: this.options.bootTimeoutMs });
+				reject(new Error('Timed out waiting for emulator-loaded'));
+			}, this.options.bootTimeoutMs);
 			this.emulator?.bus.register('emulator-loaded', () => {
+				this.log('init: emulator-loaded event callback fired');
 				clearTimeout(timer);
 				resolve();
 			});
@@ -277,16 +413,33 @@ export class V86Shell {
 
 	private waitForPrompt(): Promise<void> {
 		const started = Date.now();
+		let attempts = 0;
 		return new Promise((resolve, reject) => {
 			const tick = () => {
+				attempts += 1;
+				const promptText = this.getPromptDetectionText();
 				if (Date.now() - started > this.options.bootTimeoutMs) {
+					this.log('init: timed out waiting for shell prompt', {
+						bootTimeoutMs: this.options.bootTimeoutMs,
+						attempts,
+						bufferTail: promptText.slice(-200)
+					});
 					reject(new Error('Timed out waiting for shell prompt'));
 					return;
 				}
 
-				if (this.options.promptRegex.test(this.bootBuffer)) {
+				if (this.options.promptRegex.test(promptText)) {
+					this.log('init: prompt detected in boot buffer', { attempts, bufferTail: promptText.slice(-120) });
 					resolve();
 					return;
+				}
+
+				if (attempts % 20 === 0) {
+					this.log('init: still waiting for shell prompt', {
+						attempts,
+						elapsedMs: Date.now() - started,
+						bufferTail: promptText.slice(-120)
+					});
 				}
 
 				try {
@@ -300,6 +453,15 @@ export class V86Shell {
 
 			tick();
 		});
+	}
+
+	private getPromptDetectionText(): string {
+		return this.bootBuffer
+			.replace(/\u0000/g, '')
+			.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, '')
+			.replace(/\r/g, '')
+			.replace(/\s+/g, ' ')
+			.trim();
 	}
 
 	private processPendingRuns(): void {
@@ -358,12 +520,77 @@ export class V86Shell {
 	}
 
 	private assertSafePath(path: string): void {
-		if (!path.startsWith('/') || path.includes('..') || path.includes('\0')) {
+		const normalized = String(path ?? '').trim();
+		if (!normalized || normalized.includes('..') || normalized.includes('\0')) {
 			throw new Error(`Unsafe VM path: ${path}`);
+		}
+	}
+
+	private ensureDirectoryViaFs9p(vmPath: string): void {
+		const fs9p = this.emulator?.fs9p;
+		if (!fs9p || typeof fs9p.SearchPath !== 'function' || typeof fs9p.CreateDirectory !== 'function') {
+			return;
+		}
+
+		const normalized = String(vmPath ?? '')
+			.trim()
+			.replace(/^\/+/, '')
+			.replace(/\/+$/, '');
+		if (!normalized) {
+			return;
+		}
+
+		let currentPath = '';
+		for (const element of normalized.split('/').filter(Boolean)) {
+			currentPath += `${element}/`;
+			let node: { id: number; parentid: number };
+			try {
+				node = fs9p.SearchPath(currentPath);
+			} catch {
+				continue;
+			}
+
+			if (node.id !== -1) {
+				continue;
+			}
+
+			try {
+				fs9p.CreateDirectory(element, node.parentid);
+				this.log('fs: ensureDirectory fs9p created', { element, parentId: node.parentid, currentPath });
+			} catch (error) {
+				this.log('fs: ensureDirectory fs9p failed', {
+					element,
+					parentId: node.parentid,
+					currentPath,
+					error: String(error)
+				});
+			}
 		}
 	}
 
 	private escapeRegExp(text: string): string {
 		return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+	}
+
+	private shellSingleQuote(text: string): string {
+		return `'${String(text).replace(/'/g, `'"'"'`)}'`;
+	}
+
+	private normalizeShellPath(path: string): string {
+		const trimmed = String(path ?? '').trim();
+		if (!trimmed) return '/root';
+		if (trimmed.startsWith('/')) return trimmed;
+		if (trimmed.startsWith('root/')) return `/${trimmed}`;
+		return `/root/${trimmed.replace(/^\/+/, '')}`;
+	}
+
+	private bytesToBase64(bytes: Uint8Array): string {
+		let binary = '';
+		const chunkSize = 0x8000;
+		for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+			const chunk = bytes.subarray(offset, offset + chunkSize);
+			binary += String.fromCharCode(...chunk);
+		}
+		return btoa(binary);
 	}
 }

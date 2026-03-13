@@ -17,6 +17,9 @@ npm install
 ## Sync runtime assets
 
 The app depends on local runtime assets from the repository root (`wheels`, `v86`, `thirdparty/v86`, `Snakefile`).
+It also rebuilds and syncs the local plugin wheel from `snakemake-executor-plugin-wasm/dist` into `static/wheels`
+(`npm run build:plugin-wheel`, then copy). The build script prefers
+`snakemake-executor-plugin-wasm/.pixi/envs/default/bin/python` and falls back to `python3`.
 Pyodide is installed from npm and synced to `static/pyodide` so the worker can load it with `indexURL: '/pyodide/'`.
 
 ```sh

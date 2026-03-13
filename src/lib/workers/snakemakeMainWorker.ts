@@ -12,8 +12,394 @@ let pyodidePromise = null;
 let runtimeReady = false;
 let runtimeInitPromise = null;
 let cancelled = false;
+let maxParallelJobs = 1;
 let shellRunCounter = 0;
+let shellSlotCounter = 0;
+const workerSessionId = `w_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+const MAX_CONCURRENT_SHELL_JOBS = 3;
 const pendingShellRuns = new Map();
+const artifactStore = new Map();
+let submittedJobCounter = 0;
+const pendingJobQueue = [];
+const activeJobs = new Map();
+const jobUpdates = [];
+let jobUpdateSequence = 0;
+const cancelledAsyncJobIds = new Set();
+
+function normalizeRelativePath(pathValue) {
+  const path = String(pathValue ?? "").trim();
+  if (!path || path.startsWith("/") || path.includes("..")) {
+    throw new Error(`Invalid file path: ${path}`);
+  }
+  return path;
+}
+
+function upsertArtifact(file) {
+  if (!file || typeof file !== "object") {
+    return;
+  }
+  const path = normalizeRelativePath(file.path);
+  const encoding = file.encoding === "base64" ? "base64" : "utf-8";
+  const content = typeof file.content === "string" ? file.content : String(file.content ?? "");
+  artifactStore.set(path, {
+    path,
+    encoding,
+    content,
+    updatedAt: Date.now(),
+  });
+}
+
+function seedArtifactStore(snakefileText, files, configYaml) {
+  artifactStore.clear();
+  upsertArtifact({
+    path: "Snakefile",
+    encoding: "utf-8",
+    content: String(snakefileText ?? ""),
+  });
+  upsertArtifact({
+    path: "config.yaml",
+    encoding: "utf-8",
+    content: String(configYaml ?? ""),
+  });
+  if (Array.isArray(files)) {
+    for (const file of files) {
+      upsertArtifact(file);
+    }
+  }
+}
+
+function buildInputFilesFromArtifactStore() {
+  const files = [];
+  for (const [path, file] of artifactStore.entries()) {
+    if (path === "Snakefile" || path === "config.yaml") {
+      continue;
+    }
+    files.push({ path: file.path, encoding: file.encoding, content: file.content });
+  }
+  return files;
+}
+
+function syncOutputArtifacts(outputFiles) {
+  if (!Array.isArray(outputFiles)) {
+    return;
+  }
+  for (const file of outputFiles) {
+    if (!file || typeof file !== "object") {
+      continue;
+    }
+    if (file.encoding === "base64") {
+      upsertArtifact({
+        path: file.path,
+        encoding: "base64",
+        content: String(file.base64 ?? ""),
+      });
+    } else {
+      upsertArtifact({
+        path: file.path,
+        encoding: "utf-8",
+        content: String(file.text ?? ""),
+      });
+    }
+  }
+}
+
+function getArtifactsForPaths(paths) {
+  if (!Array.isArray(paths)) {
+    return [];
+  }
+  const artifacts = [];
+  for (const pathValue of paths) {
+    const path = normalizeRelativePath(pathValue);
+    const artifact = artifactStore.get(path);
+    if (!artifact) {
+      throw new Error(`Missing required input artifact: ${path}`);
+    }
+    artifacts.push({ path: artifact.path, encoding: artifact.encoding, content: artifact.content });
+  }
+  return artifacts;
+}
+
+function enqueueJobUpdate(update) {
+  const sequencedUpdate = {
+    ...update,
+    seq: ++jobUpdateSequence,
+    timestamp: Date.now(),
+  };
+  jobUpdates.push(sequencedUpdate);
+
+  postLog(
+    `[broker] enqueue seq=${sequencedUpdate.seq} id=${String(sequencedUpdate.externalJobId ?? "")} status=${String(sequencedUpdate.status ?? "unknown")} total=${jobUpdates.length} active=${activeJobs.size} queued=${pendingJobQueue.length}`
+  );
+
+  if (jobUpdates.length > 5000) {
+    jobUpdates.splice(0, jobUpdates.length - 5000);
+    postLog(`[broker] trim updates=5000 lastSeq=${jobUpdateSequence}`);
+  }
+}
+
+function buildJobResultFiles(resultFiles) {
+  if (!Array.isArray(resultFiles)) {
+    return [];
+  }
+  return resultFiles
+    .map((file) => {
+      if (!file || typeof file !== "object") {
+        return null;
+      }
+      const path = normalizeRelativePath(file.path);
+      if (file.encoding === "base64") {
+        return {
+          path,
+          encoding: "base64",
+          base64: String(file.base64 ?? ""),
+        };
+      }
+      return {
+        path,
+        encoding: "utf-8",
+        text: String(file.text ?? ""),
+      };
+    })
+    .filter(Boolean);
+}
+
+function getEffectiveParallelJobs() {
+  return Math.max(1, Math.min(MAX_CONCURRENT_SHELL_JOBS, Number(maxParallelJobs) || 1));
+}
+
+function toPlainValue(value) {
+  if (value && typeof value === "object" && typeof value.toJs === "function") {
+    try {
+      return toPlainValue(value.toJs());
+    } catch {
+      return value;
+    }
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((entry) => toPlainValue(entry));
+  }
+
+  if (value && typeof value === "object") {
+    const plainObject = {};
+    for (const [key, entry] of Object.entries(value)) {
+      plainObject[key] = toPlainValue(entry);
+    }
+    return plainObject;
+  }
+
+  return value;
+}
+
+function normalizeAsyncJobSpec(rawJobSpec) {
+  const jobSpec = toPlainValue(rawJobSpec) ?? {};
+  const outputPaths = Array.isArray(jobSpec.outputPaths)
+    ? jobSpec.outputPaths.map((path) => String(path ?? "").trim()).filter((path) => path.length > 0)
+    : [];
+  const inputPaths = Array.isArray(jobSpec.inputPaths)
+    ? jobSpec.inputPaths.map((path) => String(path ?? "").trim()).filter((path) => path.length > 0)
+    : [];
+
+  return {
+    ...jobSpec,
+    kind: String(jobSpec.kind ?? ""),
+    command: String(jobSpec.command ?? ""),
+    ruleName: String(jobSpec.ruleName ?? ""),
+    jobId: String(jobSpec.jobId ?? ""),
+    timeoutMs: Number.isFinite(jobSpec.timeoutMs) ? Number(jobSpec.timeoutMs) : 300000,
+    outputPaths,
+    inputPaths,
+  };
+}
+
+async function executeQueuedJob(jobSpec) {
+  const externalJobId = String(jobSpec.externalJobId ?? "");
+  try {
+    if (jobSpec.kind !== "shell") {
+      throw new Error(`Unsupported async job kind: ${String(jobSpec.kind ?? "unknown")}`);
+    }
+
+    const command = String(jobSpec.command ?? "");
+    const outputPaths = Array.isArray(jobSpec.outputPaths) ? jobSpec.outputPaths : [];
+    const inputPaths = Array.isArray(jobSpec.inputPaths) ? jobSpec.inputPaths : [];
+    const timeoutMs = Number.isFinite(jobSpec.timeoutMs) ? Number(jobSpec.timeoutMs) : 300000;
+    const inputFiles = getArtifactsForPaths(inputPaths);
+    const slotId = Number.isFinite(jobSpec.slotId) ? Number(jobSpec.slotId) : 0;
+
+    postLog(
+      `[async-job] start id=${externalJobId} kind=shell slot=${slotId} timeoutMs=${timeoutMs} inputPaths=${inputPaths.length} outputPaths=${outputPaths.length}`
+    );
+
+    const result = await runShellCommandViaHost(command, outputPaths, timeoutMs, {
+      slotId,
+      inputFiles,
+    });
+
+    postLog(
+      `[async-job] shell result id=${externalJobId} exit=${Number.isFinite(result.exitCode) ? Number(result.exitCode) : 0} files=${Array.isArray(result.files) ? result.files.length : 0}`
+    );
+
+    if (cancelledAsyncJobIds.has(externalJobId)) {
+      enqueueJobUpdate({
+        externalJobId,
+        status: "cancelled",
+        error: "Cancelled during execution",
+      });
+      return;
+    }
+
+    const resultFiles = buildJobResultFiles(result.files);
+    syncOutputArtifacts(
+      resultFiles.map((file) =>
+        file.encoding === "base64"
+          ? { path: file.path, encoding: "base64", base64: file.base64 }
+          : { path: file.path, encoding: "utf-8", text: file.text }
+      )
+    );
+
+    enqueueJobUpdate({
+      externalJobId,
+      status: "success",
+      exitCode: Number.isFinite(result.exitCode) ? Number(result.exitCode) : 0,
+      stdout: String(result.stdout ?? ""),
+      stderr: String(result.stderr ?? ""),
+      files: resultFiles,
+    });
+  } catch (error) {
+    postLog(`[async-job] error id=${externalJobId} ${String(error ?? "Unknown async job error")}`);
+    if (cancelledAsyncJobIds.has(externalJobId)) {
+      enqueueJobUpdate({
+        externalJobId,
+        status: "cancelled",
+        error: "Cancelled during execution",
+      });
+      return;
+    }
+    enqueueJobUpdate({
+      externalJobId,
+      status: "error",
+      error: String(error ?? "Unknown async job error"),
+    });
+  } finally {
+    postLog(
+      `[async-job] finalize id=${externalJobId} active=${activeJobs.size} queued=${pendingJobQueue.length}`
+    );
+    activeJobs.delete(externalJobId);
+    cancelledAsyncJobIds.delete(externalJobId);
+    void drainJobQueue();
+  }
+}
+
+async function drainJobQueue() {
+  const targetConcurrency = getEffectiveParallelJobs();
+  postLog(
+    `[async-queue] drain start target=${targetConcurrency} active=${activeJobs.size} queued=${pendingJobQueue.length}`
+  );
+  while (activeJobs.size < targetConcurrency && pendingJobQueue.length > 0) {
+    const nextJob = pendingJobQueue.shift();
+    const externalJobId = String(nextJob.externalJobId ?? "");
+    activeJobs.set(externalJobId, nextJob);
+    postLog(`[async-queue] dispatch id=${externalJobId} active=${activeJobs.size} queued=${pendingJobQueue.length}`);
+    void executeQueuedJob(nextJob);
+  }
+  postLog(
+    `[async-queue] drain end target=${targetConcurrency} active=${activeJobs.size} queued=${pendingJobQueue.length}`
+  );
+}
+
+globalThis.submitSnakemakeAsyncJob = async (jobSpec) => {
+  const normalizedJobSpec = normalizeAsyncJobSpec(jobSpec);
+  const externalJobId = `job_${Date.now()}_${submittedJobCounter++}`;
+  const slotModulo = getEffectiveParallelJobs();
+  const slotId = Number.isFinite(normalizedJobSpec?.slotId)
+    ? Number(normalizedJobSpec.slotId)
+    : shellSlotCounter++ % slotModulo;
+  pendingJobQueue.push({
+    ...normalizedJobSpec,
+    externalJobId,
+    slotId,
+  });
+  postLog(
+    `[async-queue] enqueue id=${externalJobId} kind=${String(normalizedJobSpec?.kind ?? "unknown")} slot=${slotId} queued=${pendingJobQueue.length} inputPaths=${normalizedJobSpec.inputPaths.length} outputPaths=${normalizedJobSpec.outputPaths.length} effectiveParallel=${slotModulo}`
+  );
+  void drainJobQueue();
+  return externalJobId;
+};
+
+globalThis.pollSnakemakeAsyncJobUpdates = (lastSeq = 0) => {
+  let numericLastSeq = 0;
+  if (Number.isFinite(lastSeq)) {
+    numericLastSeq = Number(lastSeq);
+  } else if (lastSeq && typeof lastSeq === "object" && typeof lastSeq.toJs === "function") {
+    try {
+      const plainSeq = Number(lastSeq.toJs());
+      numericLastSeq = Number.isFinite(plainSeq) ? plainSeq : 0;
+    } catch {
+      numericLastSeq = 0;
+    }
+  }
+
+  const updates = jobUpdates.filter((update) => Number(update.seq) > numericLastSeq);
+  postLog(
+    `[broker] poll request lastSeq=${numericLastSeq} return=${updates.length} latestSeq=${jobUpdateSequence} active=${activeJobs.size} queued=${pendingJobQueue.length}`
+  );
+  return {
+    updates,
+    lastSeq: jobUpdateSequence,
+  };
+};
+
+globalThis.cancelSnakemakeAsyncJobs = (jobIds) => {
+  const ids = new Set(Array.isArray(jobIds) ? jobIds.map((jobId) => String(jobId)) : []);
+  if (ids.size === 0) {
+    return [];
+  }
+
+  const cancelled = [];
+  for (let idx = pendingJobQueue.length - 1; idx >= 0; idx -= 1) {
+    const queuedJob = pendingJobQueue[idx];
+    const externalJobId = String(queuedJob.externalJobId ?? "");
+    if (!ids.has(externalJobId)) {
+      continue;
+    }
+    pendingJobQueue.splice(idx, 1);
+    cancelled.push(externalJobId);
+    enqueueJobUpdate({
+      externalJobId,
+      status: "cancelled",
+      error: "Cancelled before execution",
+    });
+  }
+
+  for (const [externalJobId] of activeJobs.entries()) {
+    if (!ids.has(externalJobId)) {
+      continue;
+    }
+    cancelledAsyncJobIds.add(externalJobId);
+    cancelled.push(externalJobId);
+  }
+
+  return cancelled;
+};
+
+function getAllAsyncJobIds() {
+  const ids = [];
+  for (const pendingJob of pendingJobQueue) {
+    const externalJobId = String(pendingJob.externalJobId ?? "");
+    if (externalJobId) ids.push(externalJobId);
+  }
+  for (const [externalJobId] of activeJobs.entries()) {
+    if (externalJobId) ids.push(String(externalJobId));
+  }
+  return ids;
+}
+
+function clearAsyncJobState() {
+  pendingJobQueue.length = 0;
+  activeJobs.clear();
+  jobUpdates.length = 0;
+  cancelledAsyncJobIds.clear();
+}
 
 const postLog = (text) => {
   postMessage({ type: "log", text: String(text) });
@@ -23,7 +409,7 @@ const postProgress = (payload) => {
   postMessage({ type: "progress", payload });
 };
 
-function runShellCommandViaHost(command, outputPaths = [], timeoutMs = 300000) {
+function runShellCommandViaHost(command, outputPaths = [], timeoutMs = 300000, options = {}) {
   return new Promise((resolve, reject) => {
     const requestId = `shell_${Date.now()}_${shellRunCounter++}`;
     let outputPathValues = outputPaths;
@@ -40,24 +426,75 @@ function runShellCommandViaHost(command, outputPaths = [], timeoutMs = 300000) {
           .map((path) => String(path ?? "").trim())
           .filter((path) => path.length > 0 && !path.includes("..") && !path.startsWith("/"))
       : [];
+    const slotId = Number.isFinite(options.slotId) ? Math.max(0, Math.floor(Number(options.slotId))) : 0;
+    const rawInputFiles = Array.isArray(options.inputFiles) ? options.inputFiles : [];
+    const normalizedInputFiles = rawInputFiles
+      .map((file) => {
+        if (!file || typeof file !== "object") {
+          return null;
+        }
+        try {
+          return {
+            path: normalizeRelativePath(file.path),
+            encoding: file.encoding === "base64" ? "base64" : "utf-8",
+            content: typeof file.content === "string" ? file.content : String(file.content ?? ""),
+          };
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
     const timer = setTimeout(() => {
       pendingShellRuns.delete(requestId);
+      postLog(`[shell-bridge] timeout request=${requestId} slot=${slotId} timeoutMs=${timeoutMs}`);
       reject(new Error(`Shell command timed out after ${timeoutMs} ms`));
     }, timeoutMs);
 
     pendingShellRuns.set(requestId, { resolve, reject, timer });
+    postLog(
+      `[shell-bridge] post request=${requestId} workerSession=${workerSessionId} slot=${slotId} timeoutMs=${timeoutMs} outputs=${normalizedOutputPaths.length} inputs=${normalizedInputFiles.length} pending=${pendingShellRuns.size}`
+    );
     postMessage({
       type: "shell-run-request",
       requestId,
+      workerSessionId,
       command,
       outputPaths: normalizedOutputPaths,
+      inputFiles: normalizedInputFiles,
+      slotId,
       timeoutMs,
     });
   });
 }
 
-globalThis.runSnakemakeWasmShellCommand = async (command, outputPaths) => {
-  return runShellCommandViaHost(String(command ?? ""), outputPaths);
+globalThis.runSnakemakeWasmShellCommand = async (command, outputPaths, options = {}) => {
+  let normalizedOptions = options;
+  if (normalizedOptions && typeof normalizedOptions === "object" && typeof normalizedOptions.toJs === "function") {
+    try {
+      normalizedOptions = normalizedOptions.toJs();
+    } catch {
+      normalizedOptions = {};
+    }
+  }
+
+  const slotId = Number.isFinite(normalizedOptions?.slotId)
+    ? Math.max(0, Math.floor(Number(normalizedOptions.slotId)))
+    : 0;
+  const timeoutMs = Number.isFinite(normalizedOptions?.timeoutMs)
+    ? Math.max(1, Math.floor(Number(normalizedOptions.timeoutMs)))
+    : 300000;
+  const inputPaths = Array.isArray(normalizedOptions?.inputPaths)
+    ? normalizedOptions.inputPaths
+        .map((path) => String(path ?? "").trim())
+        .filter((path) => path.length > 0)
+    : [];
+
+  const inputFiles = inputPaths.length > 0 ? getArtifactsForPaths(inputPaths) : [];
+
+  return runShellCommandViaHost(String(command ?? ""), outputPaths, timeoutMs, {
+    slotId,
+    inputFiles,
+  });
 };
 
 async function getPyodide() {
@@ -168,24 +605,23 @@ function normalizeFiles(files) {
       if (!path) {
         return null;
       }
-      if (path.startsWith("/") || path.includes("..")) {
-        throw new Error(`Invalid file path: ${path}`);
-      }
-      return { path, encoding, content };
+      return { path: normalizeRelativePath(path), encoding, content };
     })
     .filter(Boolean);
 }
 
-async function runWorkflow(pyodide, snakefileText, files, configYaml) {
+async function runWorkflow(pyodide, snakefileText, files, configYaml, parallelJobs) {
   pyodide.globals.set("_snakefile_text", snakefileText);
   pyodide.globals.set("_worker_input_files", files);
   pyodide.globals.set("_workflow_config_yaml", configYaml);
+  pyodide.globals.set("_worker_max_parallel_jobs", Number(parallelJobs) || 1);
 
   const resultJson = await pyodide.runPythonAsync(`
 import asyncio
 import json
 import sys
 from pathlib import Path
+import inspect
 
 # Clean up possibly partially initialized modules from prior failed runs.
 sys.modules.pop("snakemake.api", None)
@@ -223,6 +659,11 @@ workflow_config_yaml = _as_python(_workflow_config_yaml)
 worker_input_files = _as_python(_worker_input_files)
 if worker_input_files is None:
   worker_input_files = []
+worker_max_parallel_jobs = _as_python(_worker_max_parallel_jobs)
+try:
+  worker_max_parallel_jobs = max(1, int(worker_max_parallel_jobs))
+except Exception:
+  worker_max_parallel_jobs = 1
 
 print("Python version:", sys.version)
 
@@ -291,6 +732,28 @@ status = {
 }
 updated_files = []
 
+
+def _build_executor_settings():
+  supported_params = set()
+  try:
+    supported_params = set(inspect.signature(ExecutorSettings).parameters.keys())
+  except Exception as signature_error:
+    print(f"ExecutorSettings signature introspection failed: {signature_error}")
+
+  print("ExecutorSettings supported params:", sorted(supported_params))
+
+  executor_kwargs = {}
+  if "max_parallel_jobs" in supported_params:
+    executor_kwargs["max_parallel_jobs"] = worker_max_parallel_jobs
+
+  print("ExecutorSettings kwargs used:", executor_kwargs)
+
+  try:
+    return ExecutorSettings(**executor_kwargs)
+  except TypeError as init_error:
+    print(f"ExecutorSettings init with kwargs failed ({init_error}); falling back to defaults")
+    return ExecutorSettings()
+
 with SnakemakeApi(
     OutputSettings(
         verbose=True,
@@ -298,7 +761,10 @@ with SnakemakeApi(
     )
 ) as api:
     workflow_api = api.workflow(
-        resource_settings=ResourceSettings(cores=1, nodes=1),
+        resource_settings=ResourceSettings(
+          cores=worker_max_parallel_jobs,
+          nodes=worker_max_parallel_jobs,
+        ),
       config_settings=ConfigSettings(
         config=workflow_config,
         configfiles=[Path("config.yaml")],
@@ -313,22 +779,24 @@ with SnakemakeApi(
     dag_api = workflow_api.dag(
         dag_settings=DAGSettings(),
     )
-
-    ok = dag_api.execute_workflow(
-        executor="wasm",
-        execution_settings=ExecutionSettings(),
-      scheduling_settings=SchedulingSettings(scheduler="greedy"),
-      scheduler_settings=GreedySchedulerSettings(
-        greediness=1.0,
-        omit_prioritize_by_temp_and_input=False,
-      ),
-      greedy_scheduler_settings=GreedySchedulerSettings(
-        greediness=1.0,
-        omit_prioritize_by_temp_and_input=False,
-      ),
-        executor_settings=ExecutorSettings(),
-        updated_files=updated_files,
-    )
+    try:
+      ok = dag_api.execute_workflow(
+          executor="wasm",
+          execution_settings=ExecutionSettings(),
+        scheduling_settings=SchedulingSettings(scheduler="greedy"),
+        scheduler_settings=GreedySchedulerSettings(
+          greediness=1.0,
+          omit_prioritize_by_temp_and_input=False,
+        ),
+        greedy_scheduler_settings=GreedySchedulerSettings(
+          greediness=1.0,
+          omit_prioritize_by_temp_and_input=False,
+        ),
+          executor_settings=_build_executor_settings(),
+          updated_files=updated_files,
+      )
+    except Exception as e:
+      ok = False
 
     status["run_ok"] = ok
 status["written_files"] = [
@@ -366,6 +834,7 @@ for file_path_str in updated_files:
 status["output_files"] = output_files
 status["updated_files"] = [str(Path(path)) for path in updated_files]
 status["config_file"] = "config.yaml"
+status["max_parallel_jobs"] = worker_max_parallel_jobs
 
 json.dumps(status)
 `);
@@ -373,40 +842,60 @@ json.dumps(status)
   pyodide.globals.delete("_snakefile_text");
   pyodide.globals.delete("_worker_input_files");
   pyodide.globals.delete("_workflow_config_yaml");
+  pyodide.globals.delete("_worker_max_parallel_jobs");
   return JSON.parse(resultJson);
 }
 
-self.onmessage = async (event) => {
+const handleWorkerMessage = (event) => {
   const msg = event.data || {};
+  postLog(`[message] received type=${String(msg.type ?? "unknown")}`);
 
   if (typeof msg.pyodideIndexUrl === "string" && msg.pyodideIndexUrl.length > 0) {
     pyodideIndexUrl = msg.pyodideIndexUrl.endsWith("/") ? msg.pyodideIndexUrl : `${msg.pyodideIndexUrl}/`;
   }
 
+  if (Number.isFinite(msg.maxParallelJobs)) {
+    maxParallelJobs = Math.max(1, Math.floor(Number(msg.maxParallelJobs)));
+  }
+
   if (msg.type === "init") {
     const wheels = Array.isArray(msg.wheels) ? msg.wheels : [];
 
-    try {
-      const pyodide = await getPyodide();
-      await ensureRuntime(pyodide, wheels);
-      postMessage({ type: "init-ready" });
-    } catch (err) {
-      const errorText = err && err.message ? err.message : String(err);
-      postLog(`Runtime init failed: ${errorText}`);
-      postMessage({ type: "init-error", error: errorText });
-    }
+    void (async () => {
+      try {
+        const pyodide = await getPyodide();
+        await ensureRuntime(pyodide, wheels);
+        postMessage({ type: "init-ready" });
+      } catch (err) {
+        const errorText = err && err.message ? err.message : String(err);
+        postLog(`Runtime init failed: ${errorText}`);
+        postMessage({ type: "init-error", error: errorText });
+      }
+    })();
     return;
   }
 
   if (msg.type === "shell-run-response") {
     const requestId = String(msg.requestId || "");
+    const responseWorkerSessionId = String(msg.workerSessionId || "");
+    if (responseWorkerSessionId && responseWorkerSessionId !== workerSessionId) {
+      postLog(
+        `[shell-bridge] response worker-session mismatch request=${requestId} expected=${workerSessionId} actual=${responseWorkerSessionId}`
+      );
+    }
     const pending = pendingShellRuns.get(requestId);
     if (!pending) {
+      postLog(
+        `[shell-bridge] response with no pending request id=${requestId} workerSession=${workerSessionId} actualWorkerSession=${responseWorkerSessionId || "n/a"} pending=${pendingShellRuns.size}`
+      );
       return;
     }
 
     clearTimeout(pending.timer);
     pendingShellRuns.delete(requestId);
+    postLog(
+      `[shell-bridge] response id=${requestId} workerSession=${workerSessionId} ok=${Boolean(msg.ok)} exit=${Number.isFinite(msg.exitCode) ? Number(msg.exitCode) : "n/a"} files=${Array.isArray(msg.files) ? msg.files.length : 0} pending=${pendingShellRuns.size}`
+    );
 
     if (msg.ok) {
       pending.resolve({
@@ -426,6 +915,15 @@ self.onmessage = async (event) => {
     postLog("Cancel requested");
     postProgress({ stage: "cancel", status: "requested" });
 
+    const pendingAsyncJobIds = getAllAsyncJobIds();
+    if (pendingAsyncJobIds.length > 0) {
+      try {
+        globalThis.cancelSnakemakeAsyncJobs(pendingAsyncJobIds);
+      } catch (error) {
+        postLog(`Failed to cancel async jobs: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+
     for (const [requestId, pending] of pendingShellRuns.entries()) {
       clearTimeout(pending.timer);
       pendingShellRuns.delete(requestId);
@@ -444,34 +942,60 @@ self.onmessage = async (event) => {
   const configYaml = typeof msg.configYaml === "string" ? msg.configYaml : "";
   const files = normalizeFiles(msg.files);
   const wheels = Array.isArray(msg.wheels) ? msg.wheels : [];
+  postLog(
+    `[run] message received snakefileBytes=${snakefile.length} configBytes=${configYaml.length} files=${files.length} wheels=${wheels.length} maxParallelJobs=${maxParallelJobs}`
+  );
+  clearAsyncJobState();
+  seedArtifactStore(snakefile, files, configYaml);
+  const storeBackedFiles = buildInputFilesFromArtifactStore();
+  postLog(`[run] artifact store prepared files=${storeBackedFiles.length}`);
 
   cancelled = false;
 
-  try {
-    postProgress({ stage: "run", status: "starting" });
-    const pyodide = await getPyodide();
+  void (async () => {
+    try {
+      postProgress({ stage: "run", status: "starting" });
+      const pyodide = await getPyodide();
 
-    if (cancelled) {
-      throw new Error("Run cancelled before runtime initialization");
+      if (cancelled) {
+        throw new Error("Run cancelled before runtime initialization");
+      }
+
+      await ensureRuntime(pyodide, wheels);
+
+      if (cancelled) {
+        throw new Error("Run cancelled before workflow execution");
+      }
+
+      postLog("Starting Snakemake workflow");
+      const effectiveParallelJobs = getEffectiveParallelJobs();
+      postLog(`Configured max parallel jobs: ${maxParallelJobs}`);
+      postLog(`Effective shell parallel jobs: ${effectiveParallelJobs}`);
+      postProgress({ stage: "workflow", status: "running" });
+
+      const payload = await runWorkflow(
+        pyodide,
+        snakefile,
+        storeBackedFiles,
+        configYaml,
+        effectiveParallelJobs
+      );
+      syncOutputArtifacts(payload?.output_files);
+      postProgress({ stage: "workflow", status: "finished" });
+      postMessage({ type: "result", payload });
+    } catch (err) {
+      const errorText = err && err.message ? err.message : String(err);
+      postLog(`Workflow failed: ${errorText}`);
+      postMessage({ type: "error", error: errorText });
     }
+  })();
 
-    await ensureRuntime(pyodide, wheels);
-
-    if (cancelled) {
-      throw new Error("Run cancelled before workflow execution");
-    }
-
-    postLog("Starting Snakemake workflow");
-    postProgress({ stage: "workflow", status: "running" });
-
-    const payload = await runWorkflow(pyodide, snakefile, files, configYaml);
-
-    postLog("Workflow finished");
-    postProgress({ stage: "workflow", status: "finished" });
-    postMessage({ type: "result", payload });
-  } catch (err) {
-    const errorText = err && err.message ? err.message : String(err);
-    postLog(`Workflow failed: ${errorText}`);
-    postMessage({ type: "error", error: errorText });
-  }
+  return;
 };
+
+let workerMessageListenerInstalled = false;
+if (!workerMessageListenerInstalled) {
+  self.addEventListener("message", handleWorkerMessage);
+  workerMessageListenerInstalled = true;
+  postLog("[worker] message listener installed via addEventListener");
+}
