@@ -958,14 +958,10 @@ function runShellCommandViaHost(command, outputPaths = [], timeoutMs = 300000, o
       .filter(Boolean);
     const timer = setTimeout(() => {
       pendingShellRuns.delete(requestId);
-      postLog(`[shell-bridge] timeout request=${requestId} slot=${slotId} timeoutMs=${timeoutMs}`);
       reject(new Error(`Shell command timed out after ${timeoutMs} ms`));
     }, timeoutMs);
 
     pendingShellRuns.set(requestId, { resolve, reject, timer });
-    postLog(
-      `[shell-bridge] post request=${requestId} workerSession=${workerSessionId} slot=${slotId} timeoutMs=${timeoutMs} outputs=${normalizedOutputPaths.length} inputs=${normalizedInputFiles.length} pending=${pendingShellRuns.size}`
-    );
     postMessage({
       type: "shell-run-request",
       requestId,
@@ -1696,7 +1692,7 @@ def _build_executor_settings():
 
 with SnakemakeApi(
     OutputSettings(
-        verbose=True,
+        verbose=False,
         show_failed_logs=True,
     )
 ) as api:
@@ -1824,24 +1820,13 @@ const handleWorkerMessage = (event) => {
   if (msg.type === "shell-run-response") {
     const requestId = String(msg.requestId || "");
     const responseWorkerSessionId = String(msg.workerSessionId || "");
-    if (responseWorkerSessionId && responseWorkerSessionId !== workerSessionId) {
-      postLog(
-        `[shell-bridge] response worker-session mismatch request=${requestId} expected=${workerSessionId} actual=${responseWorkerSessionId}`
-      );
-    }
     const pending = pendingShellRuns.get(requestId);
     if (!pending) {
-      postLog(
-        `[shell-bridge] response with no pending request id=${requestId} workerSession=${workerSessionId} actualWorkerSession=${responseWorkerSessionId || "n/a"} pending=${pendingShellRuns.size}`
-      );
       return;
     }
 
     clearTimeout(pending.timer);
     pendingShellRuns.delete(requestId);
-    postLog(
-      `[shell-bridge] response id=${requestId} workerSession=${workerSessionId} ok=${Boolean(msg.ok)} exit=${Number.isFinite(msg.exitCode) ? Number(msg.exitCode) : "n/a"} files=${Array.isArray(msg.files) ? msg.files.length : 0} pending=${pendingShellRuns.size}`
-    );
 
     if (msg.ok) {
       pending.resolve({

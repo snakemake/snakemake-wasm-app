@@ -55,6 +55,6 @@
 		readonly
 		spellcheck="false"
 		class="flex-1 min-h-0 overflow-auto border border-slate-300 bg-slate-950 p-2 text-xs text-slate-100 select-text"
-		value={logs.join('\n')}
+		value={logs.filter(l => !l.startsWith('[')).join('\n')}
 	></textarea>
 </div>

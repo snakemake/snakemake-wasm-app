@@ -83,7 +83,7 @@
 	const PYODIDE_INDEX_URL = withBase('/pyodide/');
 	const PLUGIN_WHEEL_FILE = 'snakemake_executor_plugin_wasm-0.1.0-py3-none-any.whl';
 	const PLUGIN_WHEEL_CACHE_BUST = `v=${Date.now().toString(36)}`;
-	const MAX_CONCURRENT_SHELL_JOBS = 3;
+	const MAX_CONCURRENT_SHELL_JOBS = 6;
 	const DEFAULT_MAX_PARALLEL_JOBS = 1;
 
 	const runtimeWheelUrls = RUNTIME_WHEELS.map((wheelPath) => {
@@ -896,7 +896,7 @@
 		worker.onmessage = async (event: MessageEvent<WorkerInMessage>) => {
 			const msg = event.data;
 			if (msg.type === 'log') {
-				appendLog('[worker]', msg.text ?? '');
+				appendLog(msg.text ?? '');
 				return;
 			}
 			if (msg.type === 'progress') {
