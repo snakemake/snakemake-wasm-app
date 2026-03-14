@@ -162,8 +162,12 @@
 	const ENV_VARS_HASH_KEY = 'env';
 	const RUNTIME_FILES_PARAM_KEY = 'runtimefiles';
 	const WORKFLOW_TITLE_PARAM_KEY = 'title';
+	const APP_TITLE = 'Snakemake WASM App';
 
 	let workflowTitle = '';
+	let htmlTitle = APP_TITLE;
+
+	$: htmlTitle = workflowTitle ? `${workflowTitle} · ${APP_TITLE}` : APP_TITLE;
 
 	const toBase64Url = (input: string): string =>
 		input.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
@@ -1193,6 +1197,10 @@
 		worker = null;
 	});
 </script>
+
+<svelte:head>
+	<title>{htmlTitle}</title>
+</svelte:head>
 
 <div class="h-dvh w-full overflow-hidden flex flex-col">
 	<Navbar title={workflowTitle} onTitleChange={setWorkflowTitle} />
