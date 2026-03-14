@@ -140,6 +140,9 @@
 	let runtimeSupportMessage: string | null = null;
 	let maxParallelJobs = DEFAULT_MAX_PARALLEL_JOBS;
 	let envVarsInput = '';
+	let runStartedAt: number | null = null;
+	let runElapsedMs = 0;
+	let runElapsedTimer: ReturnType<typeof setInterval> | null = null;
 
 	let worker: Worker | null = null;
 	let workerRuntimeReady = false;
@@ -384,6 +387,43 @@
 	const clearOutputUrls = () => {
 		for (const url of outputUrls) URL.revokeObjectURL(url);
 		outputUrls = [];
+	};
+
+	const stopRunTimer = () => {
+		if (runElapsedTimer) {
+			clearInterval(runElapsedTimer);
+			runElapsedTimer = null;
+		}
+	};
+
+	const startRunTimer = () => {
+		runStartedAt = Date.now();
+		runElapsedMs = 0;
+		stopRunTimer();
+		runElapsedTimer = setInterval(() => {
+			if (!runStartedAt) return;
+			runElapsedMs = Math.max(0, Date.now() - runStartedAt);
+		}, 1000);
+	};
+
+	const formatElapsed = (elapsedMs: number): string => {
+		const totalSeconds = Math.max(0, Math.floor(elapsedMs / 1000));
+		const minutes = Math.floor(totalSeconds / 60)
+			.toString()
+			.padStart(2, '0');
+		const seconds = (totalSeconds % 60).toString().padStart(2, '0');
+		return `${minutes}:${seconds}`;
+	};
+
+	$: logStats = {
+		status: isRunning ? 'running' : runPending ? 'starting' : 'idle',
+		workerRuntime: workerRuntimeReady ? 'ready' : 'warming',
+		shellPool: v86ShellPool.size,
+		workers: maxParallelJobs,
+		logs: logs.length,
+		outputs: outputs.length,
+		runtimeFiles: runtimeFiles.length,
+		elapsed: formatElapsed(runElapsedMs)
 	};
 
 	const refreshUploadedFilePaths = () => {
@@ -863,11 +903,15 @@
 				appendLog('[progress]', msg.payload ?? {});
 				const stage = String(msg.payload?.stage ?? '');
 				const status = String(msg.payload?.status ?? '');
-				if (stage === 'workflow' && status === 'running') isRunning = true;
+				if (stage === 'workflow' && status === 'running') {
+					if (!runStartedAt) startRunTimer();
+					isRunning = true;
+				}
 				if (stage === 'workflow' && status === 'finished') {
 					isRunning = false;
 					runPending = false;
 					runDisabled = false;
+					stopRunTimer();
 				}
 				return;
 			}
@@ -877,6 +921,7 @@
 				isRunning = false;
 				runPending = false;
 				runDisabled = false;
+				stopRunTimer();
 				return;
 			}
 			if (msg.type === 'init-ready') {
@@ -962,6 +1007,7 @@
 				isRunning = false;
 				runPending = false;
 				runDisabled = false;
+				stopRunTimer();
 			}
 		};
 
@@ -971,6 +1017,7 @@
 			isRunning = false;
 			runPending = false;
 			runDisabled = false;
+			stopRunTimer();
 		};
 	};
 
@@ -989,6 +1036,9 @@
 		runPending = true;
 		runDisabled = true;
 		isRunning = false;
+		runStartedAt = null;
+		stopRunTimer();
+		runElapsedMs = 0;
 		outputs = [];
 		clearOutputUrls();
 
@@ -1020,10 +1070,12 @@
 			isRunning = false;
 			runPending = false;
 			runDisabled = false;
+			stopRunTimer();
 			return;
 		}
 
 		isRunning = true;
+		startRunTimer();
 
 		appendLog('[ui] copying runtime files into WASM FS', runInputs.runtimeFileCount);
 		if (runInputs.runtimeFileCount > 0) {
@@ -1112,6 +1164,8 @@
 	});
 
 	onDestroy(() => {
+		stopRunTimer();
+		runStartedAt = null;
 		clearOutputUrls();
 		for (const shell of v86ShellPool.values()) {
 			shell.destroy();
@@ -1166,7 +1220,7 @@
 
 			<div class="border border-slate-200 bg-slate-50 p-0 lg:flex-1 lg:min-h-0 lg:overflow-hidden">
 				<Tabs defaultValue="logs" class="flex flex-col lg:h-full lg:min-h-0">
-					<Tabs.List class="flex border-b border-slate-200 overflow-x-auto lg:shrink-0">
+					<Tabs.List class="flex border-b border-slate-200 overflow-x-auto lg:shrink-0 mb-0">
 						<Tabs.Trigger value="logs" class="flex-1" >
 							<div class="flex items-center gap-2"><Logs class="size-4" />Logs</div>
 						</Tabs.Trigger>
@@ -1187,7 +1241,7 @@
 
 					<Tabs.Content value="logs" class="p-2 lg:flex-1 lg:min-h-0 lg:overflow-auto">
 						<div class="lg:h-full lg:min-h-0">
-							<LogPanel {logs} terminalRef={setTerminalRef} />
+							<LogPanel {logs} stats={logStats} terminalRef={setTerminalRef} />
 						</div>
 					</Tabs.Content>
 

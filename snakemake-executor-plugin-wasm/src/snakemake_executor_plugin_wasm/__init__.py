@@ -204,17 +204,27 @@ def _is_safe_relative_path(path_value: str) -> bool:
 
 
 class Executor(RealExecutor):
+    def _ensure_runtime_state(self) -> None:
+        if not hasattr(self, "_async_shell_jobs") or not isinstance(self._async_shell_jobs, dict):
+            self._async_shell_jobs = {}
+        if not hasattr(self, "_async_shell_submitted_at") or not isinstance(self._async_shell_submitted_at, dict):
+            self._async_shell_submitted_at = {}
+        if not hasattr(self, "_async_run_jobs") or not isinstance(self._async_run_jobs, dict):
+            self._async_run_jobs = {}
+        if not hasattr(self, "_async_run_submitted_at") or not isinstance(self._async_run_submitted_at, dict):
+            self._async_run_submitted_at = {}
+        if not hasattr(self, "_warned_sync_run_parallel_limit"):
+            self._warned_sync_run_parallel_limit = False
+        if not hasattr(self, "_run_job_counter"):
+            self._run_job_counter = 0
+        if not hasattr(self, "_job_update_cursor"):
+            self._job_update_cursor = 0
+
     def __post_init__(self):
         super_post_init = getattr(super(), "__post_init__", None)
         if callable(super_post_init):
             super_post_init()
-        self._async_shell_jobs: dict[str, SubmittedJobInfo] = {}
-        self._async_shell_submitted_at: dict[str, float] = {}
-        self._async_run_jobs: dict[str, tuple[SubmittedJobInfo, asyncio.Task]] = {}
-        self._async_run_submitted_at: dict[str, float] = {}
-        self._warned_sync_run_parallel_limit = False
-        self._run_job_counter = 0
-        self._job_update_cursor = 0
+        self._ensure_runtime_state()
 
     def get_exec_mode(self):
         return ExecMode.SUBPROCESS
@@ -344,7 +354,7 @@ class Executor(RealExecutor):
             value = int(getattr(self.executor_settings, "max_parallel_jobs", 1) or 1)
         except Exception:
             value = 1
-        return max(2, value)
+        return max(1, value)
 
     def job_args_and_prepare(self, job: JobExecutorInterface) -> dict:
         self.workflow.async_run(job.prepare())
@@ -731,6 +741,7 @@ class Executor(RealExecutor):
         )
 
     def _submit_async_run_job(self, job: JobExecutorInterface, job_info: SubmittedJobInfo) -> str:
+        self._ensure_runtime_state()
         external_job_id = f"run_{job.jobid}_{self._run_job_counter}"
         self._run_job_counter += 1
 
@@ -748,6 +759,7 @@ class Executor(RealExecutor):
         return external_job_id
 
     def run_jobs(self, jobs: list[JobExecutorInterface]):
+        self._ensure_runtime_state()
         shell_jobs: list[tuple[SubmittedJobInfo, JobExecutorInterface]] = []
 
         for job in jobs:
@@ -820,6 +832,7 @@ class Executor(RealExecutor):
         return
 
     def run_job_legacy(self, job: JobExecutorInterface):
+        self._ensure_runtime_state()
         job_info = SubmittedJobInfo(job=job)
 
         try:
@@ -856,6 +869,7 @@ class Executor(RealExecutor):
             raise WorkflowError(f"Failed to execute wasm job: {e}") from e
 
     async def check_active_jobs(self, active_jobs):
+        self._ensure_runtime_state()
         await asyncio.sleep(0)
         active_job_infos = list(active_jobs)
         active_job_keys = [self._job_key(active_job_info.job) for active_job_info in active_job_infos]
@@ -876,7 +890,10 @@ class Executor(RealExecutor):
                 yield active_job_info
             return
 
-        raw_updates = pollSnakemakeAsyncJobUpdates(self._job_update_cursor)
+        try:
+            raw_updates = pollSnakemakeAsyncJobUpdates(self._job_update_cursor)
+        except TypeError:
+            raw_updates = pollSnakemakeAsyncJobUpdates()
         self._debug_log(f"poll bridge response type={type(raw_updates).__name__}")
         try:
             updates = raw_updates.to_py()
@@ -972,8 +989,13 @@ class Executor(RealExecutor):
                     duration = max(0.0, time.perf_counter() - started_at)
                 self._ensure_shell_benchmark_files(run_job_info.job, running_time_s=duration)
                 self.report_job_success(run_job_info)
+            cancelled_attr = getattr(run_task, "cancelled", None)
+            if callable(cancelled_attr):
+                cancelled_state = bool(cancelled_attr())
+            else:
+                cancelled_state = bool(cancelled_attr)
             self._debug_log(
-                f"run-task complete id={run_id} done={run_task.done()} cancelled={run_task.cancelled()} job_key={self._job_key(run_job_info.job)}"
+                f"run-task complete id={run_id} done={run_task.done()} cancelled={cancelled_state} job_key={self._job_key(run_job_info.job)}"
             )
 
         for completed_id in completed_ids:
@@ -1033,6 +1055,7 @@ class Executor(RealExecutor):
         )
 
     def cancel_jobs(self, active_jobs):
+        self._ensure_runtime_state()
         active_job_keys = {self._job_key(active_job_info.job) for active_job_info in active_jobs}
         shell_ids_to_cancel: list[str] = []
         run_ids_to_cancel: list[str] = []
@@ -1065,6 +1088,7 @@ class Executor(RealExecutor):
         return None
 
     def shutdown(self):
+        self._ensure_runtime_state()
         if self._async_shell_jobs:
             try:
                 from js import cancelSnakemakeAsyncJobs

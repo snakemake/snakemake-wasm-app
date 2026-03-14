@@ -12,7 +12,7 @@ let pyodidePromise = null;
 let runtimeReady = false;
 let runtimeInitPromise = null;
 let cancelled = false;
-let maxParallelJobs = 1;
+let maxParallelJobs = 2;
 let shellRunCounter = 0;
 let shellSlotCounter = 0;
 const workerSessionId = `w_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -777,15 +777,44 @@ async function executeQueuedJob(jobSpec) {
 
 async function drainJobQueue() {
   const targetConcurrency = getEffectiveParallelJobs();
+  const pickDispatchSlot = () => {
+    const slotModulo = Math.max(1, targetConcurrency);
+    const usedSlots = new Set(
+      Array.from(activeJobs.values())
+        .map((job) => (Number.isFinite(job?.slotId) ? Number(job.slotId) : null))
+        .filter((slotId) => slotId !== null)
+    );
+    const start = shellSlotCounter % slotModulo;
+    for (let offset = 0; offset < slotModulo; offset += 1) {
+      const candidate = (start + offset) % slotModulo;
+      if (!usedSlots.has(candidate)) {
+        shellSlotCounter = (candidate + 1) % slotModulo;
+        return candidate;
+      }
+    }
+    const fallback = start;
+    shellSlotCounter = (fallback + 1) % slotModulo;
+    return fallback;
+  };
+
   postLog(
     `[async-queue] drain start target=${targetConcurrency} active=${activeJobs.size} queued=${pendingJobQueue.length}`
   );
   while (activeJobs.size < targetConcurrency && pendingJobQueue.length > 0) {
     const nextJob = pendingJobQueue.shift();
     const externalJobId = String(nextJob.externalJobId ?? "");
-    activeJobs.set(externalJobId, nextJob);
-    postLog(`[async-queue] dispatch id=${externalJobId} active=${activeJobs.size} queued=${pendingJobQueue.length}`);
-    void executeQueuedJob(nextJob);
+    const slotId = Number.isFinite(nextJob?.slotId)
+      ? Math.max(0, Math.floor(Number(nextJob.slotId)))
+      : pickDispatchSlot();
+    const dispatchedJob = {
+      ...nextJob,
+      slotId,
+    };
+    activeJobs.set(externalJobId, dispatchedJob);
+    postLog(
+      `[async-queue] dispatch id=${externalJobId} slot=${slotId} active=${activeJobs.size} queued=${pendingJobQueue.length}`
+    );
+    void executeQueuedJob(dispatchedJob);
   }
   postLog(
     `[async-queue] drain end target=${targetConcurrency} active=${activeJobs.size} queued=${pendingJobQueue.length}`
@@ -795,17 +824,15 @@ async function drainJobQueue() {
 globalThis.submitSnakemakeAsyncJob = async (jobSpec) => {
   const normalizedJobSpec = normalizeAsyncJobSpec(jobSpec);
   const externalJobId = `job_${Date.now()}_${submittedJobCounter++}`;
-  const slotModulo = getEffectiveParallelJobs();
-  const slotId = Number.isFinite(normalizedJobSpec?.slotId)
-    ? Number(normalizedJobSpec.slotId)
-    : shellSlotCounter++ % slotModulo;
   pendingJobQueue.push({
     ...normalizedJobSpec,
     externalJobId,
-    slotId,
   });
+  const slotLog = Number.isFinite(normalizedJobSpec?.slotId)
+    ? Math.max(0, Math.floor(Number(normalizedJobSpec.slotId)))
+    : "auto";
   postLog(
-    `[async-queue] enqueue id=${externalJobId} kind=${String(normalizedJobSpec?.kind ?? "unknown")} slot=${slotId} queued=${pendingJobQueue.length} inputPaths=${normalizedJobSpec.inputPaths.length} outputPaths=${normalizedJobSpec.outputPaths.length} effectiveParallel=${slotModulo}`
+    `[async-queue] enqueue id=${externalJobId} kind=${String(normalizedJobSpec?.kind ?? "unknown")} slot=${slotLog} queued=${pendingJobQueue.length} inputPaths=${normalizedJobSpec.inputPaths.length} outputPaths=${normalizedJobSpec.outputPaths.length} effectiveParallel=${getEffectiveParallelJobs()}`
   );
   void drainJobQueue();
   return externalJobId;
@@ -1647,17 +1674,25 @@ def _build_executor_settings():
 
   print("ExecutorSettings supported params:", sorted(supported_params))
 
-  executor_kwargs = {}
-  if "max_parallel_jobs" in supported_params:
-    executor_kwargs["max_parallel_jobs"] = worker_max_parallel_jobs
+  if "max_parallel_jobs" not in supported_params:
+    raise WorkflowError(
+      "Loaded wasm executor plugin does not support 'max_parallel_jobs'. "
+      "Rebuild and sync the plugin wheel before running with parallel workers."
+    )
+
+  executor_kwargs = {
+    "max_parallel_jobs": worker_max_parallel_jobs,
+  }
 
   print("ExecutorSettings kwargs used:", executor_kwargs)
 
   try:
     return ExecutorSettings(**executor_kwargs)
   except TypeError as init_error:
-    print(f"ExecutorSettings init with kwargs failed ({init_error}); falling back to defaults")
-    return ExecutorSettings()
+    raise WorkflowError(
+      "ExecutorSettings initialization failed for wasm executor plugin: "
+      f"{init_error}"
+    )
 
 with SnakemakeApi(
     OutputSettings(
