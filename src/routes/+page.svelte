@@ -138,6 +138,8 @@
 	let runtimeFiles: RuntimeFileItem[] = [];
 	let outputUrls: string[] = [];
 	let runtimeSupportMessage: string | null = null;
+	let runtimeSupportLinkHref: string | null = null;
+	let runtimeSupportLinkLabel: string | null = null;
 	let maxParallelJobs = DEFAULT_MAX_PARALLEL_JOBS;
 	let envVarsInput = '';
 	let runStartedAt: number | null = null;
@@ -372,12 +374,27 @@
 		return { envvars, invalidLines };
 	};
 
-	const toRuntimeSupportMessage = (errorText: string): string | null => {
-		if (!errorText) return null;
-		if (errorText.includes('can_run_sync')) {
-			return 'Snakemake Wasm is not supported in this browser. Please use the latest version of Chrome.';
+	const clearRuntimeSupportNotice = () => {
+		runtimeSupportMessage = null;
+		runtimeSupportLinkHref = null;
+		runtimeSupportLinkLabel = null;
+	};
+
+	const applyRuntimeSupportNotice = (errorText: string) => {
+		if (!errorText) {
+			clearRuntimeSupportNotice();
+			return;
 		}
-		return null;
+
+		if (errorText.includes('can_run_sync')) {
+			runtimeSupportMessage =
+				'Snakemake-Wasm is not supported in this browser. Please use the latest version of Chrome or a browser with JSPI support.';
+			runtimeSupportLinkHref = 'https://caniuse.com/wf-wasm-jspi';
+			runtimeSupportLinkLabel = 'Check JSPI browser support';
+			return;
+		}
+
+		clearRuntimeSupportNotice();
 	};
 
 	const setTerminalRef = (element: HTMLDivElement | null) => {
@@ -927,7 +944,7 @@
 			if (msg.type === 'init-ready') {
 				workerRuntimeReady = true;
 				runDisabled = runPending ? true : false;
-				runtimeSupportMessage = null;
+				clearRuntimeSupportNotice();
 				workerRuntimeInitResolve?.();
 				resetWorkerRuntimeInitLatch();
 				appendLog('[ui] prewarm: worker runtime ready');
@@ -936,7 +953,7 @@
 			if (msg.type === 'init-error') {
 				workerRuntimeReady = false;
 				runDisabled = runPending ? true : false;
-				runtimeSupportMessage = toRuntimeSupportMessage(String(msg.error ?? ''));
+				applyRuntimeSupportNotice(String(msg.error ?? ''));
 				workerRuntimeInitReject?.(new Error(msg.error ?? 'unknown'));
 				resetWorkerRuntimeInitLatch();
 				appendLog('[ui] prewarm: worker runtime failed', msg.error ?? 'unknown');
@@ -1003,7 +1020,7 @@
 					return;
 				}
 				appendLog('[error]', errorText);
-				runtimeSupportMessage = toRuntimeSupportMessage(errorText);
+				applyRuntimeSupportNotice(errorText);
 				isRunning = false;
 				runPending = false;
 				runDisabled = false;
@@ -1013,7 +1030,7 @@
 
 		worker.onerror = (event) => {
 			appendLog('[worker onerror]', event.message, event.filename, event.lineno, event.colno);
-			runtimeSupportMessage = toRuntimeSupportMessage(String(event.message ?? ''));
+			applyRuntimeSupportNotice(String(event.message ?? ''));
 			isRunning = false;
 			runPending = false;
 			runDisabled = false;
@@ -1031,7 +1048,7 @@
 		if (envVarParse.invalidLines.length > 0) {
 			appendLog('[ui] invalid env var lines skipped', envVarParse.invalidLines);
 		}
-		runtimeSupportMessage = null;
+		clearRuntimeSupportNotice();
 
 		runPending = true;
 		runDisabled = true;
@@ -1181,7 +1198,7 @@
 	<Navbar title={workflowTitle} onTitleChange={setWorkflowTitle} />
 
 	<main class="w-full flex-1 min-h-0 px-4 py-4 overflow-hidden">
-	<div class="grid grid-cols-1 gap-4 lg:h-full xl:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
+	<div class="grid grid-cols-1 gap-4 lg:h-full lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
 		<section class="min-h-0 flex flex-col gap-2 bg-slate-50">
 			<div class="min-h-0 flex-1 ">
 				<IdeTabs
@@ -1272,11 +1289,16 @@
 	<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" role="alertdialog" aria-live="assertive">
 		<div class="w-full max-w-md rounded border border-red-300 bg-white p-4 text-center shadow">
 			<p class="text-sm text-slate-800">{runtimeSupportMessage}</p>
+			{#if runtimeSupportLinkHref && runtimeSupportLinkLabel}
+				<p class="mt-2 text-xs text-slate-600">
+					<a class="underline" href={runtimeSupportLinkHref} target="_blank" rel="noreferrer">{runtimeSupportLinkLabel}</a>
+				</p>
+			{/if}
 			<div class="mt-3">
 				<button
 					type="button"
 					class="rounded border border-slate-300 px-3 py-1 text-sm text-slate-700 hover:bg-slate-50"
-					onclick={() => (runtimeSupportMessage = null)}
+					onclick={clearRuntimeSupportNotice}
 				>
 					OK
 				</button>
