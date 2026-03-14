@@ -4,7 +4,7 @@
 	"version": "0.0.1",
 	"type": "module",
 	"scripts": {
-		"dev": "vite dev --host",
+		"dev": "vite dev",
 		"build": "vite build",
 		"preview": "vite preview",
 		"sync:pyodide": "mkdir -p static/pyodide && rsync -a --delete node_modules/pyodide/ static/pyodide/",
