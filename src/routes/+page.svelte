@@ -2,6 +2,7 @@
 	import { onDestroy, onMount } from 'svelte';
 	import { base } from '$app/paths';
 	import { Tabs } from '@skeletonlabs/skeleton-svelte';
+	import { FileOutput, Logs, Settings2 } from '@lucide/svelte';
 	import IdeTabs from '$lib/components/IdeTabs.svelte';
 	import type { IdeTabItem } from '$lib/components/IdeTabs.svelte';
 	import Navbar from '$lib/components/Navbar.svelte';
@@ -55,6 +56,7 @@
 				snakefile: string;
 				configYaml: string;
 				files: InputFilePayload[];
+				envvars?: Record<string, string>;
 				wheels: string[];
 				pyodideIndexUrl: string;
 				maxParallelJobs?: number;
@@ -124,6 +126,7 @@
 	let outputs: OutputFilePayload[] = [];
 	let runDisabled = true;
 	let isRunning = false;
+	let runPending = false;
 	let shellReady = false;
 	let terminalElement: HTMLDivElement | null = null;
 	let tabs: IdeTabItem[] = [
@@ -136,6 +139,7 @@
 	let outputUrls: string[] = [];
 	let runtimeSupportMessage: string | null = null;
 	let maxParallelJobs = DEFAULT_MAX_PARALLEL_JOBS;
+	let envVarsInput = '';
 
 	let worker: Worker | null = null;
 	let workerRuntimeReady = false;
@@ -150,6 +154,7 @@
 	const v86ShellInitInFlight = new Map<number, Promise<V86Shell>>();
 
 	const IDE_STATE_HASH_KEY = 'code';
+	const ENV_VARS_HASH_KEY = 'env';
 	const RUNTIME_FILES_PARAM_KEY = 'runtimefiles';
 	const WORKFLOW_TITLE_PARAM_KEY = 'title';
 
@@ -236,10 +241,42 @@
 		return true;
 	};
 
+	const restoreEnvVarsFromHash = () => {
+		const rawHash = window.location.hash.replace(/^#/, '');
+		if (!rawHash) {
+			envVarsInput = '';
+			return;
+		}
+
+		const hashParams = new URLSearchParams(rawHash);
+		const encoded = hashParams.get(ENV_VARS_HASH_KEY);
+		if (!encoded) {
+			envVarsInput = '';
+			return;
+		}
+
+		try {
+			const base64 = fromBase64Url(encoded);
+			const bytes = base64ToBytes(base64);
+			envVarsInput = new TextDecoder().decode(bytes);
+		} catch {
+			envVarsInput = '';
+		}
+	};
+
 	const persistIdeStateToUrl = () => {
 		const encoded = serializeIdeState();
 		const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ''));
 		hashParams.set(IDE_STATE_HASH_KEY, encoded);
+
+		const normalizedEnvInput = String(envVarsInput ?? '');
+		if (normalizedEnvInput.trim().length > 0) {
+			const envBytes = new TextEncoder().encode(normalizedEnvInput);
+			hashParams.set(ENV_VARS_HASH_KEY, toBase64Url(bytesToBase64(envBytes)));
+		} else {
+			hashParams.delete(ENV_VARS_HASH_KEY);
+		}
+
 		const nextHash = hashParams.toString();
 		const nextUrl = `${window.location.pathname}${window.location.search}${nextHash ? `#${nextHash}` : ''}`;
 		window.history.replaceState(window.history.state, '', nextUrl);
@@ -300,6 +337,36 @@
 
 	const setWorkerCount = (rawValue: string) => {
 		maxParallelJobs = clampWorkerCount(Number(rawValue));
+	};
+
+	const parseEnvVarsInput = (
+		rawInput: string
+	): { envvars: Record<string, string>; invalidLines: string[] } => {
+		const envvars: Record<string, string> = {};
+		const invalidLines: string[] = [];
+		const lines = String(rawInput ?? '').split(/\r?\n/);
+
+		for (const line of lines) {
+			const trimmed = line.trim();
+			if (!trimmed || trimmed.startsWith('#')) continue;
+
+			const separatorIndex = trimmed.indexOf('=');
+			if (separatorIndex <= 0) {
+				invalidLines.push(trimmed);
+				continue;
+			}
+
+			const key = trimmed.slice(0, separatorIndex).trim();
+			const value = trimmed.slice(separatorIndex + 1);
+			if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+				invalidLines.push(trimmed);
+				continue;
+			}
+
+			envvars[key] = value;
+		}
+
+		return { envvars, invalidLines };
 	};
 
 	const toRuntimeSupportMessage = (errorText: string): string | null => {
@@ -691,7 +758,11 @@
 	const syncShellInputFiles = async (shell: V86Shell, inputFiles: InputFilePayload[]): Promise<void> => {
 		for (const inputFile of inputFiles) {
 			const vmPath = normalizeVmOutputPath(inputFile.path);
-			if (!vmPath) continue;
+			if (!vmPath) {
+				appendLog('[pathmap] shell input skipped', { relativePath: inputFile.path, vmPath: null });
+				continue;
+			}
+			appendLog('[pathmap] shell input', { relativePath: inputFile.path, vmPath });
 
 			try {
 				if (inputFile.encoding === 'base64') {
@@ -710,11 +781,15 @@
 		const directories = new Set<string>();
 		for (const outputPath of outputPaths) {
 			const vmPath = normalizeVmOutputPath(outputPath);
-			if (!vmPath) continue;
+			if (!vmPath) {
+				appendLog('[pathmap] shell output skipped', { relativePath: outputPath, vmPath: null });
+				continue;
+			}
 			const slashIndex = vmPath.lastIndexOf('/');
 			if (slashIndex <= 0) continue;
 			const directory = vmPath.slice(0, slashIndex).trim();
 			if (!directory || directory === '/root') continue;
+			appendLog('[pathmap] shell output dir', { relativePath: outputPath, vmPath, directory });
 			directories.add(directory);
 		}
 
@@ -733,7 +808,11 @@
 		const synced: ShellSyncedFile[] = [];
 		for (const outputPath of outputPaths) {
 			const vmPath = normalizeVmOutputPath(outputPath);
-			if (!vmPath) continue;
+			if (!vmPath) {
+				appendLog('[pathmap] shell collect skipped', { relativePath: outputPath, vmPath: null });
+				continue;
+			}
+			appendLog('[pathmap] shell collect', { relativePath: outputPath, vmPath });
 
 			try {
 				const bytes = await shell.readFile(vmPath);
@@ -785,19 +864,24 @@
 				const stage = String(msg.payload?.stage ?? '');
 				const status = String(msg.payload?.status ?? '');
 				if (stage === 'workflow' && status === 'running') isRunning = true;
-				if (stage === 'workflow' && status === 'finished') isRunning = false;
+				if (stage === 'workflow' && status === 'finished') {
+					isRunning = false;
+					runPending = false;
+					runDisabled = false;
+				}
 				return;
 			}
 			if (msg.type === 'result') {
 				clearOutputUrls();
 				outputs = Array.isArray(msg.payload?.output_files) ? msg.payload.output_files : [];
 				isRunning = false;
+				runPending = false;
 				runDisabled = false;
 				return;
 			}
 			if (msg.type === 'init-ready') {
 				workerRuntimeReady = true;
-				runDisabled = false;
+				runDisabled = runPending ? true : false;
 				runtimeSupportMessage = null;
 				workerRuntimeInitResolve?.();
 				resetWorkerRuntimeInitLatch();
@@ -806,7 +890,7 @@
 			}
 			if (msg.type === 'init-error') {
 				workerRuntimeReady = false;
-				runDisabled = false;
+				runDisabled = runPending ? true : false;
 				runtimeSupportMessage = toRuntimeSupportMessage(String(msg.error ?? ''));
 				workerRuntimeInitReject?.(new Error(msg.error ?? 'unknown'));
 				resetWorkerRuntimeInitLatch();
@@ -867,7 +951,7 @@
 				if (workerRuntimeInitInFlight && errorText.includes('Unsupported message type: init')) {
 					workerInitSupported = false;
 					workerRuntimeReady = false;
-					runDisabled = false;
+					runDisabled = runPending ? true : false;
 					workerRuntimeInitResolve?.();
 					resetWorkerRuntimeInitLatch();
 					appendLog('[ui] prewarm: worker init not supported, falling back to run-time init');
@@ -876,6 +960,7 @@
 				appendLog('[error]', errorText);
 				runtimeSupportMessage = toRuntimeSupportMessage(errorText);
 				isRunning = false;
+				runPending = false;
 				runDisabled = false;
 			}
 		};
@@ -884,6 +969,7 @@
 			appendLog('[worker onerror]', event.message, event.filename, event.lineno, event.colno);
 			runtimeSupportMessage = toRuntimeSupportMessage(String(event.message ?? ''));
 			isRunning = false;
+			runPending = false;
 			runDisabled = false;
 		};
 	};
@@ -893,8 +979,14 @@
 		if (!worker) return;
 		const runInputs = buildRunInputsFromTabs();
 		if (!runInputs) return;
+		const envVarParse = parseEnvVarsInput(envVarsInput);
+		const envvars = envVarParse.envvars;
+		if (envVarParse.invalidLines.length > 0) {
+			appendLog('[ui] invalid env var lines skipped', envVarParse.invalidLines);
+		}
 		runtimeSupportMessage = null;
 
+		runPending = true;
 		runDisabled = true;
 		isRunning = false;
 		outputs = [];
@@ -926,6 +1018,7 @@
 		} catch (error) {
 			appendLog('[error]', String(error));
 			isRunning = false;
+			runPending = false;
 			runDisabled = false;
 			return;
 		}
@@ -942,6 +1035,7 @@
 			snakefile: runInputs.snakefile,
 			configYaml: runInputs.configYaml,
 			files: runInputs.files,
+			envvars,
 			wheels: runtimeWheelUrls,
 			pyodideIndexUrl: PYODIDE_INDEX_URL,
 			maxParallelJobs
@@ -949,6 +1043,7 @@
 		appendLog('[ui] runWorkflow: worker.postMessage(run) sent', {
 			filesCount: runInputs.files.length,
 			runtimeFileCount: runInputs.runtimeFileCount,
+			envVarCount: Object.keys(envvars).length,
 			maxParallelJobs
 		});
 
@@ -961,12 +1056,13 @@
 		logs = [];
 	};
 
-	$: tabs, activeTabId, scheduleIdeStatePersist();
+	$: tabs, activeTabId, envVarsInput, scheduleIdeStatePersist();
 
 	onMount(() => {
 		applyWorkflowTitleFromUrl();
 		setupWorker();
 		const restoredFromUrl = applyIdeStateFromUrl();
+		restoreEnvVarsFromHash();
 		ideUrlSyncReady = true;
 		scheduleIdeStatePersist();
 
@@ -1071,8 +1167,21 @@
 			<div class="border border-slate-200 bg-slate-50 p-0 lg:flex-1 lg:min-h-0 lg:overflow-hidden">
 				<Tabs defaultValue="logs" class="flex flex-col lg:h-full lg:min-h-0">
 					<Tabs.List class="flex border-b border-slate-200 overflow-x-auto lg:shrink-0">
-						<Tabs.Trigger value="logs">Logs</Tabs.Trigger>
-						<Tabs.Trigger value="output"><div class="flex items-center gap-2">Output <span class="rounded-xl bg-blue-200 px-1 text-xs items-center">{outputs.length}</span></div></Tabs.Trigger>
+						<Tabs.Trigger value="logs" class="flex-1" >
+							<div class="flex items-center gap-2"><Logs class="size-4" />Logs</div>
+						</Tabs.Trigger>
+						<Tabs.Trigger value="output" class="flex-1">
+							<div class="flex items-center gap-2">
+								<FileOutput class="size-4" />
+								Output
+								<span class="inline-flex min-w-5 items-center justify-center rounded-full border border-blue-300 bg-blue-100 px-1.5 py-0.5 text-[11px] font-semibold leading-none text-blue-800">
+									{outputs.length}
+								</span>
+							</div>
+						</Tabs.Trigger>
+						<Tabs.Trigger value="envvars" class="flex-1">
+							<div class="flex items-center gap-2"><Settings2 class="size-4" />Config</div>
+						</Tabs.Trigger>
 						<Tabs.Indicator />
 					</Tabs.List>
 
@@ -1084,6 +1193,19 @@
 
 					<Tabs.Content value="output" class="p-2 lg:flex-1 lg:min-h-0 lg:overflow-auto">
 						<OutputDownloads outputs={outputs} {toDownloadUrl} />
+					</Tabs.Content>
+
+					<Tabs.Content value="envvars" class="p-2 lg:flex-1 lg:min-h-0 lg:overflow-auto">
+						<div class="border border-slate-200 bg-white p-2">
+							<label for="envvars-input" class="block text-xs font-medium text-slate-700">Environment Variables</label>
+							<p class="mt-1 text-xs text-slate-500">One per line as <code>KEY=VALUE</code>. Example: <code>FEATURE_TEST_TOKEN=abc123</code></p>
+							<textarea
+								id="envvars-input"
+								class="mt-2 h-40 w-full resize-y border border-slate-300 p-2 text-xs font-mono"
+								placeholder="FEATURE_TEST_TOKEN=..."
+								bind:value={envVarsInput}
+							></textarea>
+						</div>
 					</Tabs.Content>
 				</Tabs>
 			</div>
