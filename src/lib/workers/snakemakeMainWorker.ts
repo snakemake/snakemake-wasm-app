@@ -30,6 +30,14 @@ let webROutputCapture = null;
 const PYODIDE_WORKDIR_PREFIX = "/home/pyodide/";
 const WEBR_WORKSPACE_PREFIX = "/workspace/";
 
+function shortPathForLog(value, maxLength = 180) {
+  const normalized = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+  return `${normalized.slice(0, maxLength)}…`;
+}
+
 function formatWorkerError(error) {
   if (error instanceof Error) {
     const name = String(error.name || "Error");
@@ -137,32 +145,50 @@ async function ensureWebRDirectory(webR, absolutePath) {
 
 function toWorkspaceRelativePath(pathValue) {
   const rawPath = String(pathValue ?? "").trim();
-  if (!rawPath) return null;
+  if (!rawPath) {
+    postLog(`[pathmap] toWorkspaceRelativePath raw=<empty> -> null`);
+    return null;
+  }
 
   if (rawPath.startsWith(PYODIDE_WORKDIR_PREFIX)) {
     const relative = rawPath.slice(PYODIDE_WORKDIR_PREFIX.length).trim();
     if (!relative || relative.includes("..") || relative.startsWith("/")) {
+      postLog(
+        `[pathmap] toWorkspaceRelativePath raw=${shortPathForLog(rawPath)} source=pyodide -> null`
+      );
       return null;
     }
+    postLog(
+      `[pathmap] toWorkspaceRelativePath raw=${shortPathForLog(rawPath)} source=pyodide -> ${shortPathForLog(relative)}`
+    );
     return relative;
   }
 
   if (rawPath.startsWith(WEBR_WORKSPACE_PREFIX)) {
     const relative = rawPath.slice(WEBR_WORKSPACE_PREFIX.length).trim();
     if (!relative || relative.includes("..") || relative.startsWith("/")) {
+      postLog(`[pathmap] toWorkspaceRelativePath raw=${shortPathForLog(rawPath)} source=webr -> null`);
       return null;
     }
+    postLog(
+      `[pathmap] toWorkspaceRelativePath raw=${shortPathForLog(rawPath)} source=webr -> ${shortPathForLog(relative)}`
+    );
     return relative;
   }
 
   if (rawPath.startsWith("/")) {
+    postLog(`[pathmap] toWorkspaceRelativePath raw=${shortPathForLog(rawPath)} source=abs -> null`);
     return null;
   }
 
   if (rawPath.includes("..")) {
+    postLog(`[pathmap] toWorkspaceRelativePath raw=${shortPathForLog(rawPath)} source=relative -> null`);
     return null;
   }
 
+  postLog(
+    `[pathmap] toWorkspaceRelativePath raw=${shortPathForLog(rawPath)} source=relative -> ${shortPathForLog(rawPath)}`
+  );
   return rawPath;
 }
 
@@ -190,6 +216,12 @@ function buildWebROutputReadCandidates(pathValue) {
     seen.add(candidate.absPath);
     unique.push(candidate);
   }
+
+  postLog(
+    `[pathmap] webr output candidates raw=${shortPathForLog(rawPath)} -> ${JSON.stringify(
+      unique.map((candidate) => candidate.absPath)
+    )}`
+  );
   return unique;
 }
 
@@ -315,6 +347,11 @@ globalThis.runSnakemakeWasmRScript = async (scriptSource, options = {}) => {
         ? pyodideMirrorPath.slice(0, pyodideMirrorPath.lastIndexOf("/"))
         : PYODIDE_WORKDIR_PREFIX;
       await ensureWebRDirectory(webR, pyodideMirrorParentPath);
+      postLog(
+        `[pathmap] webr write input rel=${shortPathForLog(relPath)} webr=${shortPathForLog(
+          absPath
+        )} pyodideMirror=${shortPathForLog(pyodideMirrorPath)}`
+      );
       if (inputFile.encoding === "base64") {
         const bytes = base64ToBytes(String(inputFile.content ?? ""));
         await webR.FS.writeFile(absPath, bytes);
@@ -348,10 +385,20 @@ globalThis.runSnakemakeWasmRScript = async (scriptSource, options = {}) => {
     const files = [];
     for (const outputPath of outputPaths) {
       const candidates = buildWebROutputReadCandidates(outputPath);
+      postLog(
+        `[pathmap] webr read output raw=${shortPathForLog(outputPath)} candidates=${JSON.stringify(
+          candidates.map((candidate) => candidate.absPath)
+        )}`
+      );
       const found = await readWebRFileWithRetries(webR, candidates, 3500, 200);
 
       if (found) {
         const { candidate, fileBytes } = found;
+        postLog(
+          `[pathmap] webr output found raw=${shortPathForLog(outputPath)} abs=${shortPathForLog(
+            candidate?.absPath
+          )} rel=${shortPathForLog(candidate?.relativePath)}`
+        );
         let bytes = fileBytes;
         if (bytes && typeof bytes.toJs === "function") {
           bytes = bytes.toJs();
@@ -502,6 +549,61 @@ function getArtifactsForPaths(paths) {
   return artifacts;
 }
 
+async function getInputFilesForPathsWithFallback(paths, contextLabel = "shell") {
+  if (!Array.isArray(paths)) {
+    return [];
+  }
+
+  const resolvedFiles = [];
+  const missingPaths = [];
+
+  for (const pathValue of paths) {
+    const path = normalizeRelativePath(pathValue);
+    const artifact = artifactStore.get(path);
+    if (artifact) {
+      resolvedFiles.push({ path: artifact.path, encoding: artifact.encoding, content: artifact.content });
+    } else {
+      missingPaths.push(path);
+    }
+  }
+
+  if (missingPaths.length === 0) {
+    return resolvedFiles;
+  }
+
+  const pyodide = await getPyodide();
+
+  for (const relPath of missingPaths) {
+    const fsCandidates = [`/home/pyodide/${relPath}`, relPath];
+    let recoveredBytes = null;
+
+    for (const candidatePath of fsCandidates) {
+      try {
+        const bytes = pyodide.FS.readFile(candidatePath);
+        recoveredBytes = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+        break;
+      } catch {
+        // try next candidate path
+      }
+    }
+
+    if (!recoveredBytes) {
+      throw new Error(`Missing required input artifact: ${relPath}`);
+    }
+
+    const base64Content = bytesToBase64(recoveredBytes);
+    upsertArtifact({
+      path: relPath,
+      encoding: "base64",
+      content: base64Content,
+    });
+    resolvedFiles.push({ path: relPath, encoding: "base64", content: base64Content });
+    postLog(`[${contextLabel}] recovered input from Pyodide FS: ${relPath} bytes=${recoveredBytes.length}`);
+  }
+
+  return resolvedFiles;
+}
+
 function enqueueJobUpdate(update) {
   const sequencedUpdate = {
     ...update,
@@ -606,7 +708,7 @@ async function executeQueuedJob(jobSpec) {
     const outputPaths = Array.isArray(jobSpec.outputPaths) ? jobSpec.outputPaths : [];
     const inputPaths = Array.isArray(jobSpec.inputPaths) ? jobSpec.inputPaths : [];
     const timeoutMs = Number.isFinite(jobSpec.timeoutMs) ? Number(jobSpec.timeoutMs) : 300000;
-    const inputFiles = getArtifactsForPaths(inputPaths);
+    const inputFiles = await getInputFilesForPathsWithFallback(inputPaths, "async-job");
     const slotId = Number.isFinite(jobSpec.slotId) ? Number(jobSpec.slotId) : 0;
 
     postLog(
@@ -891,7 +993,7 @@ globalThis.runSnakemakeWasmShellCommand = async (command, outputPaths, options =
         .filter(Boolean)
     : [];
 
-  const artifactInputFiles = inputPaths.length > 0 ? getArtifactsForPaths(inputPaths) : [];
+  const artifactInputFiles = inputPaths.length > 0 ? await getInputFilesForPathsWithFallback(inputPaths, "shell") : [];
   const inputFilesByPath = new Map();
   for (const file of artifactInputFiles) {
     inputFilesByPath.set(file.path, file);
@@ -1043,7 +1145,21 @@ function normalizeFiles(files) {
     .filter(Boolean);
 }
 
-async function runWorkflow(pyodide, snakefileText, files, configYaml, parallelJobs) {
+function normalizeEnvVars(rawEnvVars) {
+  if (!rawEnvVars || typeof rawEnvVars !== "object") {
+    return {};
+  }
+
+  const normalized = {};
+  for (const [rawKey, rawValue] of Object.entries(rawEnvVars)) {
+    const key = String(rawKey ?? "").trim();
+    if (!key) continue;
+    normalized[key] = String(rawValue ?? "");
+  }
+  return normalized;
+}
+
+async function runWorkflow(pyodide, snakefileText, files, configYaml, parallelJobs, envVars = {}) {
   const resolveImportsForCodeChunk = async (code, label = "code") => {
     await loadPackagesForCode(pyodide, code, String(label ?? "code"));
   };
@@ -1053,10 +1169,12 @@ async function runWorkflow(pyodide, snakefileText, files, configYaml, parallelJo
   pyodide.globals.set("_worker_input_files", files);
   pyodide.globals.set("_workflow_config_yaml", configYaml);
   pyodide.globals.set("_worker_max_parallel_jobs", Number(parallelJobs) || 1);
+  pyodide.globals.set("_worker_envvars", envVars);
 
   const resultJson = await pyodide.runPythonAsync(`
 import asyncio
 import json
+import os
 import runpy
 import sys
 from pathlib import Path
@@ -1105,6 +1223,9 @@ try:
   worker_max_parallel_jobs = max(1, int(worker_max_parallel_jobs))
 except Exception:
   worker_max_parallel_jobs = 1
+worker_envvars = _as_python(_worker_envvars)
+if not isinstance(worker_envvars, dict):
+  worker_envvars = {}
 
 print("Python version:", sys.version)
 
@@ -1485,6 +1606,26 @@ workflow_config = yaml.safe_load(config_yaml_text) or {}
 if not isinstance(workflow_config, dict):
   raise ValueError("config.yaml must contain a YAML mapping/object at the top level")
 
+config_envvars = workflow_config.pop("__envvars", None)
+if config_envvars is None:
+  config_envvars = {}
+if not isinstance(config_envvars, dict):
+  raise ValueError("config key '__envvars' must be a mapping/object when provided")
+
+merged_envvars = {}
+for source_envvars in (config_envvars, worker_envvars):
+  for env_key, env_value in source_envvars.items():
+    key = str(env_key or "").strip()
+    if not key:
+      continue
+    merged_envvars[key] = "" if env_value is None else str(env_value)
+
+for env_key, env_value in merged_envvars.items():
+  os.environ[env_key] = env_value
+
+if merged_envvars:
+  print("Applied worker envvars:", sorted(merged_envvars.keys()))
+
 if workflow_config.get("trim") is None:
   workflow_config["trim"] = {}
 if workflow_config.get("kmer") is None:
@@ -1492,6 +1633,7 @@ if workflow_config.get("kmer") is None:
 
 status = {
     "python": sys.version,
+  "envvars": sorted(merged_envvars.keys()),
 }
 updated_files = []
 
@@ -1558,7 +1700,6 @@ with SnakemakeApi(
           executor_settings=_build_executor_settings(),
           updated_files=updated_files,
       )
-    #snakemake_interface_common.exceptions.WorkflowError
     except WorkflowError as workflow_error:
       print(f"Workflow execution failed with WorkflowError: {workflow_error}")
       ok = False
@@ -1612,6 +1753,7 @@ json.dumps(status)
   pyodide.globals.delete("_worker_input_files");
   pyodide.globals.delete("_workflow_config_yaml");
   pyodide.globals.delete("_worker_max_parallel_jobs");
+  pyodide.globals.delete("_worker_envvars");
   return JSON.parse(resultJson);
 }
 
@@ -1710,9 +1852,10 @@ const handleWorkerMessage = (event) => {
   const snakefile = typeof msg.snakefile === "string" ? msg.snakefile : "";
   const configYaml = typeof msg.configYaml === "string" ? msg.configYaml : "";
   const files = normalizeFiles(msg.files);
+  const envVars = normalizeEnvVars(msg.envvars);
   const wheels = Array.isArray(msg.wheels) ? msg.wheels : [];
   postLog(
-    `[run] message received snakefileBytes=${snakefile.length} configBytes=${configYaml.length} files=${files.length} wheels=${wheels.length} maxParallelJobs=${maxParallelJobs}`
+    `[run] message received snakefileBytes=${snakefile.length} configBytes=${configYaml.length} files=${files.length} wheels=${wheels.length} envVars=${Object.keys(envVars).length} maxParallelJobs=${maxParallelJobs}`
   );
   clearAsyncJobState();
   seedArtifactStore(snakefile, files, configYaml);
@@ -1749,7 +1892,8 @@ const handleWorkerMessage = (event) => {
         snakefile,
         storeBackedFiles,
         configYaml,
-        effectiveParallelJobs
+        effectiveParallelJobs,
+        envVars
       );
       syncOutputArtifacts(payload?.output_files);
       // postProgress({ stage: "workflow", status: "finished" });

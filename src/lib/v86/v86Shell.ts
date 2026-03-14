@@ -266,9 +266,35 @@ export class V86Shell {
 		if (!this.emulator) throw new Error('Shell not initialized');
 		this.assertSafePath(vmPath);
 		this.log('fs: readFile start', { vmPath });
-		const bytes = await this.emulator.read_file(vmPath);
-		this.log('fs: readFile done', { vmPath, bytes: bytes.length });
-		return bytes;
+
+		try {
+			const bytes = await this.emulator.read_file(vmPath);
+			this.log('fs: readFile done', { vmPath, bytes: bytes.length, mode: 'direct' });
+			return bytes;
+		} catch (directError) {
+			this.log('fs: readFile direct failed', { vmPath, error: String(directError) });
+
+			const fs9pExists = this.pathExistsViaFs9p(vmPath);
+			if (fs9pExists === false) {
+				this.log('fs: readFile fs9p missing', { vmPath });
+				throw directError;
+			}
+			if (fs9pExists === true) {
+				this.log('fs: readFile fs9p exists', { vmPath });
+			}
+
+			const fallback = await this.readFileViaShell(vmPath);
+			if (fallback !== null) {
+				this.log('fs: readFile done', { vmPath, bytes: fallback.length, mode: 'shell-fallback' });
+				return fallback;
+			}
+
+			if (fs9pExists === true) {
+				this.log('fs: readFile assuming empty file after fallback miss', { vmPath });
+				return new Uint8Array(0);
+			}
+			throw directError;
+		}
 	}
 
 	async writeFile(vmPath: string, data: Uint8Array): Promise<void> {
@@ -592,5 +618,107 @@ export class V86Shell {
 			binary += String.fromCharCode(...chunk);
 		}
 		return btoa(binary);
+	}
+
+	private base64ToBytes(base64: string): Uint8Array {
+		const normalized = String(base64 ?? '').trim();
+		if (!normalized) return new Uint8Array(0);
+		const binary = atob(normalized);
+		const bytes = new Uint8Array(binary.length);
+		for (let i = 0; i < binary.length; i += 1) {
+			bytes[i] = binary.charCodeAt(i);
+		}
+		return bytes;
+	}
+
+	private async readFileViaShell(vmPath: string): Promise<Uint8Array | null> {
+		const shellPath = this.normalizeShellPath(vmPath);
+		const quotedPath = this.shellSingleQuote(shellPath);
+		const command = [
+			`if [ -e ${quotedPath} ]; then`,
+			`  __sz=$(wc -c < ${quotedPath} 2>/dev/null || echo 0)`,
+			`  printf '__86V_FILE_SIZE__:%s\\n' "$__sz"`,
+			'  if [ "$__sz" -gt 0 ]; then',
+			`    printf '__86V_B64_BEGIN__'`,
+			`    base64 < ${quotedPath} | tr -d '\\n'`,
+			`    printf '__86V_B64_END__'`,
+			'  fi',
+			'else',
+			`  printf '__86V_FILE_MISSING__\\n'`,
+			'fi'
+		].join('\n');
+		const result = await this.run(command, { timeoutMs: Math.max(60000, this.options.runTimeoutMs) });
+		if (result.exitCode !== 0 || result.stdout.includes('__86V_FILE_MISSING__')) {
+			return null;
+		}
+
+		const sizeMatch = result.stdout.match(/__86V_FILE_SIZE__:(\d+)/);
+		if (!sizeMatch) {
+			throw new Error(`Unable to parse file size from shell read fallback for ${shellPath}`);
+		}
+
+		const size = Number(sizeMatch[1]);
+		if (!Number.isFinite(size) || size < 0) {
+			throw new Error(`Invalid file size from shell read fallback for ${shellPath}: ${sizeMatch[1]}`);
+		}
+
+		if (size === 0) {
+			return new Uint8Array(0);
+		}
+
+		const beginToken = '__86V_B64_BEGIN__';
+		const endToken = '__86V_B64_END__';
+		const begin = result.stdout.indexOf(beginToken);
+		const end = result.stdout.indexOf(endToken, begin >= 0 ? begin + beginToken.length : 0);
+		if (begin < 0 || end < 0 || end < begin) {
+			throw new Error(`Missing base64 payload markers from shell read fallback for ${shellPath}`);
+		}
+
+		const payload = result.stdout.slice(begin + beginToken.length, end).trim();
+		try {
+			return this.base64ToBytes(payload);
+		} catch (error) {
+			throw new Error(
+				`Failed to decode shell fallback payload for ${shellPath}: ${String(error)} (payloadPreview=${payload.slice(0, 120)})`
+			);
+		}
+	}
+
+	private pathExistsViaFs9p(vmPath: string): boolean | null {
+		const fs9p = this.emulator?.fs9p;
+		if (!fs9p || typeof fs9p.SearchPath !== 'function') {
+			return null;
+		}
+
+		const normalized = String(vmPath ?? '').trim().replace(/\/+/g, '/');
+		if (!normalized) {
+			return null;
+		}
+
+		const candidates = Array.from(
+			new Set(
+				[
+					normalized,
+					normalized.replace(/^\/+/, ''),
+					normalized.replace(/^\/root\//, 'root/'),
+					normalized.replace(/^\/root\//, '')
+				].filter((path) => path.length > 0)
+			)
+		);
+
+		for (const candidate of candidates) {
+			try {
+				const node = fs9p.SearchPath(candidate);
+				if (node && typeof node.id === 'number' && node.id !== -1) {
+					this.log('fs: fs9p SearchPath hit', { vmPath, candidate, id: node.id });
+					return true;
+				}
+			} catch {
+				/* try next candidate */
+			}
+		}
+
+		this.log('fs: fs9p SearchPath miss', { vmPath, candidates });
+		return false;
 	}
 }
