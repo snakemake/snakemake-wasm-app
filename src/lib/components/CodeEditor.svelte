@@ -21,7 +21,7 @@
 	const languageForPath = async (inputPath: string): Promise<Extension> => {
 		const normalized = inputPath.trim().toLowerCase();
 
-		if (normalized === 'snakefile' || normalized.endsWith('.py')) {
+		if (normalized === 'snakefile' || normalized.endsWith(".smk") || normalized.endsWith('.py')) {
 			const mod = await import('@codemirror/lang-python');
 			return mod.python();
 		}
