@@ -20,7 +20,9 @@
 		"@codemirror/lang-python": "^6.2.1",
 		"@codemirror/lang-yaml": "^6.1.2",
 		"codemirror": "^6.0.2",
-		"pyodide": "^0.29.3"
+		"codemirror-lang-r": "^0.1.1",
+		"pyodide": "^0.29.3",
+		"webr": "^0.5.8"
 	},
 	"devDependencies": {
 		"@skeletonlabs/skeleton": "^4.12.1",

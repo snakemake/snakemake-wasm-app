@@ -13,7 +13,7 @@
 		terminalRef(null);
 	});
 
-	let logElement = $state<HTMLPreElement | null>(null);
+	let logElement = $state<HTMLTextAreaElement | null>(null);
 
 	$effect(() => {
 		void (async () => {
@@ -27,5 +27,11 @@
 </script>
 
 <div class="flex h-full min-h-0 flex-col">
-	<pre bind:this={logElement} class="flex-1 min-h-0 overflow-auto border border-slate-300 bg-slate-950 p-2 text-xs text-slate-100">{logs.join('\n')}</pre>
+	<textarea
+		bind:this={logElement}
+		readonly
+		spellcheck="false"
+		class="flex-1 min-h-0 overflow-auto border border-slate-300 bg-slate-950 p-2 text-xs text-slate-100 select-text"
+		value={logs.join('\n')}
+	></textarea>
 </div>

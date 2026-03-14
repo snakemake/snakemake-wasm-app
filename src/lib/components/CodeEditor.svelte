@@ -31,6 +31,11 @@
 			return mod.yaml();
 		}
 
+        if (normalized.endsWith('.r')) {
+            const mod = await import('codemirror-lang-r');
+            return mod.r();
+        }
+
 		return [];
 	};
 

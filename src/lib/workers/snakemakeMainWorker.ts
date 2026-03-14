@@ -25,6 +25,389 @@ const activeJobs = new Map();
 const jobUpdates = [];
 let jobUpdateSequence = 0;
 const cancelledAsyncJobIds = new Set();
+let webRRuntimePromise = null;
+let webROutputCapture = null;
+const PYODIDE_WORKDIR_PREFIX = "/home/pyodide/";
+const WEBR_WORKSPACE_PREFIX = "/workspace/";
+
+function formatWorkerError(error) {
+  if (error instanceof Error) {
+    const name = String(error.name || "Error");
+    const message = String(error.message || "");
+    const stack = String(error.stack || "").trim();
+    const cause =
+      error && typeof error === "object" && "cause" in error
+        ? String(error.cause ?? "")
+        : "";
+
+    return [
+      `${name}: ${message}`.trim(),
+      cause ? `Cause: ${cause}` : "",
+      stack,
+    ]
+      .filter((part) => part.length > 0)
+      .join("\n");
+  }
+
+  return String(error ?? "Unknown error");
+}
+
+function bytesToBase64(bytes) {
+  const array = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes ?? []);
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let idx = 0; idx < array.length; idx += chunkSize) {
+    const chunk = array.subarray(idx, idx + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
+
+function base64ToBytes(base64Value) {
+  const normalized = String(base64Value ?? "");
+  const binary = atob(normalized);
+  const bytes = new Uint8Array(binary.length);
+  for (let idx = 0; idx < binary.length; idx += 1) {
+    bytes[idx] = binary.charCodeAt(idx);
+  }
+  return bytes;
+}
+
+function inferMimeTypeFromPath(pathValue) {
+  const normalized = String(pathValue ?? "").trim().toLowerCase();
+  const extension = normalized.includes(".") ? normalized.slice(normalized.lastIndexOf(".") + 1) : "";
+
+  switch (extension) {
+    case "txt":
+    case "log":
+    case "tsv":
+    case "csv":
+    case "json":
+    case "yaml":
+    case "yml":
+    case "r":
+      return "text/plain;charset=utf-8";
+    case "png":
+      return "image/png";
+    case "jpg":
+    case "jpeg":
+      return "image/jpeg";
+    case "gif":
+      return "image/gif";
+    case "svg":
+      return "image/svg+xml";
+    case "pdf":
+      return "application/pdf";
+    default:
+      return "application/octet-stream";
+  }
+}
+
+async function getWebRRuntime() {
+  if (!webRRuntimePromise) {
+    webRRuntimePromise = (async () => {
+      postLog("Initializing webR runtime");
+      const webrModule = await import("webr");
+      const webR = new webrModule.WebR({
+        interactive: false,
+      });
+      await webR.init();
+      postLog("webR runtime ready");
+      return webR;
+    })();
+  }
+
+  return webRRuntimePromise;
+}
+
+async function ensureWebRDirectory(webR, absolutePath) {
+  const normalized = String(absolutePath ?? "").trim();
+  if (!normalized || normalized === "/") return;
+  const segments = normalized.split("/").filter((segment) => segment.length > 0);
+  let current = "";
+  for (const segment of segments) {
+    current = `${current}/${segment}`;
+    try {
+      await webR.FS.mkdir(current);
+    } catch {
+      // directory may already exist
+    }
+  }
+}
+
+function toWorkspaceRelativePath(pathValue) {
+  const rawPath = String(pathValue ?? "").trim();
+  if (!rawPath) return null;
+
+  if (rawPath.startsWith(PYODIDE_WORKDIR_PREFIX)) {
+    const relative = rawPath.slice(PYODIDE_WORKDIR_PREFIX.length).trim();
+    if (!relative || relative.includes("..") || relative.startsWith("/")) {
+      return null;
+    }
+    return relative;
+  }
+
+  if (rawPath.startsWith(WEBR_WORKSPACE_PREFIX)) {
+    const relative = rawPath.slice(WEBR_WORKSPACE_PREFIX.length).trim();
+    if (!relative || relative.includes("..") || relative.startsWith("/")) {
+      return null;
+    }
+    return relative;
+  }
+
+  if (rawPath.startsWith("/")) {
+    return null;
+  }
+
+  if (rawPath.includes("..")) {
+    return null;
+  }
+
+  return rawPath;
+}
+
+function buildWebROutputReadCandidates(pathValue) {
+  const rawPath = String(pathValue ?? "").trim();
+  if (!rawPath) return [];
+
+  const candidates = [];
+  const relativePath = toWorkspaceRelativePath(rawPath);
+
+  if (relativePath) {
+    candidates.push({ absPath: `${WEBR_WORKSPACE_PREFIX}${relativePath}`, relativePath });
+    candidates.push({ absPath: `${PYODIDE_WORKDIR_PREFIX}${relativePath}`, relativePath });
+  }
+
+  if (rawPath.startsWith("/")) {
+    candidates.push({ absPath: rawPath, relativePath });
+  }
+
+  const unique = [];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    if (!candidate || !candidate.absPath) continue;
+    if (seen.has(candidate.absPath)) continue;
+    seen.add(candidate.absPath);
+    unique.push(candidate);
+  }
+  return unique;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function readWebRFileWithRetries(webR, candidates, maxWaitMs = 3000, intervalMs = 200) {
+  const startedAt = Date.now();
+  let firstPass = true;
+
+  while (firstPass || Date.now() - startedAt <= maxWaitMs) {
+    firstPass = false;
+    for (const candidate of candidates) {
+      if (!candidate || !candidate.absPath || !candidate.relativePath) {
+        continue;
+      }
+
+      try {
+        const fileBytes = await webR.FS.readFile(candidate.absPath);
+        return { candidate, fileBytes };
+      } catch {
+        // try next candidate
+      }
+    }
+
+    await sleep(intervalMs);
+  }
+
+  return null;
+}
+
+globalThis.runSnakemakeWasmRScript = async (scriptSource, options = {}) => {
+  let normalizedOptions = options;
+  if (normalizedOptions && typeof normalizedOptions === "object" && typeof normalizedOptions.toJs === "function") {
+    try {
+      normalizedOptions = normalizedOptions.toJs();
+    } catch {
+      normalizedOptions = {};
+    }
+  }
+
+  const timeoutMs = Number.isFinite(normalizedOptions?.timeoutMs)
+    ? Math.max(1, Math.floor(Number(normalizedOptions.timeoutMs)))
+    : 300000;
+  const inputPaths = Array.isArray(normalizedOptions?.inputPaths)
+    ? normalizedOptions.inputPaths
+        .map((path) => String(path ?? "").trim())
+        .filter((path) => path.length > 0)
+    : [];
+  const explicitInputFiles = Array.isArray(normalizedOptions?.inputFiles)
+    ? normalizedOptions.inputFiles
+        .map((file) => {
+          if (!file || typeof file !== "object") {
+            return null;
+          }
+          try {
+            return {
+              path: normalizeRelativePath(file.path),
+              encoding: file.encoding === "base64" ? "base64" : "utf-8",
+              content: typeof file.content === "string" ? file.content : String(file.content ?? ""),
+            };
+          } catch {
+            return null;
+          }
+        })
+        .filter(Boolean)
+    : [];
+  const outputPaths = Array.isArray(normalizedOptions?.outputPaths)
+    ? normalizedOptions.outputPaths
+        .map((path) => String(path ?? "").trim())
+        .filter((path) => path.length > 0)
+    : [];
+
+  const inputFilesByPath = new Map();
+  for (const file of explicitInputFiles) {
+    inputFilesByPath.set(file.path, file);
+  }
+  for (const pathValue of inputPaths) {
+    const relativePath = toWorkspaceRelativePath(pathValue);
+    if (!relativePath) {
+      continue;
+    }
+    const path = normalizeRelativePath(relativePath);
+    if (inputFilesByPath.has(path)) {
+      continue;
+    }
+    const artifact = artifactStore.get(path);
+    if (!artifact) {
+      throw new Error(`Missing required input artifact: ${path}`);
+    }
+    inputFilesByPath.set(path, {
+      path: artifact.path,
+      encoding: artifact.encoding,
+      content: artifact.content,
+    });
+  }
+  const inputFiles = Array.from(inputFilesByPath.values());
+  const workspaceDir = "/home/pyodide";
+  const scriptPath = `${workspaceDir}/.snakemake_webr_script.R`;
+  const webRShimPrelude = [
+    "# snakemake-wasm webR prelude",
+    "if (requireNamespace('webr', quietly = TRUE)) {",
+    "  webr::shim_install()",
+    "} else {",
+    "  message('webR support package not available; skipping shim_install()')",
+    "}",
+    "",
+  ].join("\n");
+
+  const runPromise = (async () => {
+    const webR = await getWebRRuntime();
+
+    await ensureWebRDirectory(webR, workspaceDir);
+
+    for (const inputFile of inputFiles) {
+      const relPath = normalizeRelativePath(inputFile.path);
+      const absPath = `${workspaceDir}/${relPath}`;
+      const parentPath = absPath.includes("/") ? absPath.slice(0, absPath.lastIndexOf("/")) : workspaceDir;
+      await ensureWebRDirectory(webR, parentPath);
+      const pyodideMirrorPath = `${PYODIDE_WORKDIR_PREFIX}${relPath}`;
+      const pyodideMirrorParentPath = pyodideMirrorPath.includes("/")
+        ? pyodideMirrorPath.slice(0, pyodideMirrorPath.lastIndexOf("/"))
+        : PYODIDE_WORKDIR_PREFIX;
+      await ensureWebRDirectory(webR, pyodideMirrorParentPath);
+      if (inputFile.encoding === "base64") {
+        const bytes = base64ToBytes(String(inputFile.content ?? ""));
+        await webR.FS.writeFile(absPath, bytes);
+        await webR.FS.writeFile(pyodideMirrorPath, bytes);
+      } else {
+        const text = String(inputFile.content ?? "");
+        const bytes = new TextEncoder().encode(text);
+        await webR.FS.writeFile(absPath, bytes);
+        await webR.FS.writeFile(pyodideMirrorPath, bytes);
+      }
+    }
+
+    const scriptWithPrelude = `${webRShimPrelude}${String(scriptSource ?? "")}`;
+    await webR.FS.writeFile(scriptPath, new TextEncoder().encode(scriptWithPrelude));
+
+    const escapedWorkspaceDir = workspaceDir.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const escapedScriptPath = scriptPath.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+
+    webROutputCapture = { stdout: [], stderr: [] };
+
+    try {
+      await webR.evalRVoid(`setwd('${escapedWorkspaceDir}')`);
+      await webR.evalRVoid(`source('${escapedScriptPath}')`);
+    } finally {
+      // keep captured output available for return, then clear shared capture
+    }
+
+    const captured = webROutputCapture ?? { stdout: [], stderr: [] };
+    webROutputCapture = null;
+
+    const files = [];
+    for (const outputPath of outputPaths) {
+      const candidates = buildWebROutputReadCandidates(outputPath);
+      const found = await readWebRFileWithRetries(webR, candidates, 3500, 200);
+
+      if (found) {
+        const { candidate, fileBytes } = found;
+        let bytes = fileBytes;
+        if (bytes && typeof bytes.toJs === "function") {
+          bytes = bytes.toJs();
+        }
+
+        if (!(bytes instanceof Uint8Array)) {
+          try {
+            bytes = new Uint8Array(bytes);
+          } catch {
+            bytes = new TextEncoder().encode(String(bytes ?? ""));
+          }
+        }
+
+        const mimeType = inferMimeTypeFromPath(candidate.relativePath);
+        if (mimeType.startsWith("text/")) {
+          files.push({ path: candidate.relativePath, encoding: "utf-8", text: new TextDecoder().decode(bytes) });
+        } else {
+          files.push({ path: candidate.relativePath, encoding: "base64", base64: bytesToBase64(bytes) });
+        }
+      } else {
+        postLog(
+          `[webr] output not found: ${String(outputPath)} candidates=${candidates
+            .map((candidate) => candidate.absPath)
+            .join(",")}`
+        );
+      }
+    }
+
+    return {
+      exitCode: 0,
+      stdout: captured.stdout.join("\n"),
+      stderr: captured.stderr.join("\n"),
+      files,
+    };
+  })();
+
+  const timeoutPromise = new Promise((_, reject) => {
+    setTimeout(() => reject(new Error(`webR script timed out after ${timeoutMs} ms`)), timeoutMs);
+  });
+
+  try {
+    return await Promise.race([runPromise, timeoutPromise]);
+  } catch (error) {
+    const formattedError = formatWorkerError(error);
+    postLog(`[webr:error] ${formattedError}`);
+    const captured = webROutputCapture ?? { stdout: [], stderr: [] };
+    webROutputCapture = null;
+    return {
+      exitCode: 1,
+      stdout: captured.stdout.join("\n"),
+      stderr: captured.stderr.join("\n"),
+      error: formattedError,
+      files: [],
+    };
+  }
+};
 
 function normalizeRelativePath(pathValue) {
   const path = String(pathValue ?? "").trim();
@@ -701,6 +1084,8 @@ from snakemake.settings.types import (
 )
 
 from snakemake_executor_plugin_wasm import ExecutorSettings
+from snakemake_interface_common.exceptions import WorkflowError
+
 import yaml
 
 
@@ -796,6 +1181,88 @@ try:
 
   _orig_python_execute_script = _snakemake_script.PythonScript.execute_script
   _orig_bash_execute_script = _snakemake_script.BashScript.execute_script
+  _orig_r_execute_script = _snakemake_script.RScript.execute_script
+
+  def _materialize_script_result_files(result_dict, _base64_module):
+    if not isinstance(result_dict, dict):
+      return
+
+    for file_entry in result_dict.get("files", []):
+      if not isinstance(file_entry, dict):
+        continue
+
+      rel_path = str(file_entry.get("path", "")).strip()
+      if not rel_path:
+        continue
+      if rel_path.startswith("/") or ".." in rel_path:
+        raise RuntimeError(f"Rejected unsafe script output path: {rel_path!r}")
+
+      out_path = Path(rel_path)
+      out_path.parent.mkdir(parents=True, exist_ok=True)
+
+      encoding = str(file_entry.get("encoding", "base64"))
+      if encoding == "base64":
+        payload = str(file_entry.get("base64", ""))
+        out_path.write_bytes(_base64_module.b64decode(payload))
+      elif encoding == "utf-8":
+        out_path.write_text(str(file_entry.get("text", "")), encoding="utf-8")
+      else:
+        raise RuntimeError(
+          f"Unsupported script output encoding {encoding!r} for {rel_path!r}"
+        )
+
+  def _collect_cross_runtime_input_files(path_values):
+    input_files = []
+    workspace_root = Path(".").resolve()
+
+    for raw_path in path_values:
+      path_text = str(raw_path or "").strip()
+      if not path_text:
+        continue
+
+      original_path = Path(path_text)
+      file_path = original_path
+      relative_path = original_path
+
+      if original_path.is_absolute():
+        try:
+          relative_path = original_path.resolve().relative_to(workspace_root)
+          file_path = original_path.resolve()
+        except Exception:
+          continue
+      else:
+        file_path = (workspace_root / original_path).resolve()
+        try:
+          relative_path = file_path.relative_to(workspace_root)
+        except Exception:
+          continue
+
+      relative_text = relative_path.as_posix()
+      if not relative_text or relative_text.startswith("../") or relative_text == "..":
+        continue
+      if not file_path.exists() or not file_path.is_file():
+        continue
+
+      try:
+        input_files.append(
+          {
+            "path": relative_text,
+            "encoding": "utf-8",
+            "content": file_path.read_text(encoding="utf-8"),
+          }
+        )
+      except UnicodeDecodeError:
+        import base64 as _base64
+
+        input_files.append(
+          {
+            "path": relative_text,
+            "encoding": "base64",
+            "content": _base64.b64encode(file_path.read_bytes()).decode("ascii"),
+          }
+        )
+
+    return input_files
 
   def _pyodide_python_execute_script(self, fname, edit=False, *args, **kwargs):
     if sys.platform != "emscripten":
@@ -846,6 +1313,7 @@ try:
       input_paths = [str(path) for path in getattr(self, "input", []) if str(path)]
     except Exception:
       input_paths = []
+    input_files = _collect_cross_runtime_input_files(input_paths)
 
     try:
       script_source = script_path.read_text(encoding="utf-8")
@@ -866,6 +1334,7 @@ try:
         {
           "timeoutMs": 300000,
           "inputPaths": input_paths,
+          "inputFiles": input_files,
         },
       )
 
@@ -891,35 +1360,92 @@ try:
         f"Bash script failed in v86 (exit {exit_code}): {stderr or stdout or command}"
       )
 
+    _materialize_script_result_files(result, _base64)
+
+    return result
+
+  def _pyodide_r_execute_script(self, fname, edit=False, *args, **kwargs):
+    if sys.platform != "emscripten":
+      return _orig_r_execute_script(self, fname, edit=edit, *args, **kwargs)
+
+    script_path = Path(str(fname))
+    if not script_path.exists():
+      raise FileNotFoundError(f"R script not found: {script_path}")
+
+    output_paths = []
+    try:
+      output_paths = [str(path) for path in getattr(self, "output", []) if str(path)]
+    except Exception:
+      output_paths = []
+
+    input_paths = []
+    try:
+      input_paths = [str(path) for path in getattr(self, "input", []) if str(path)]
+    except Exception:
+      input_paths = []
+    input_files = _collect_cross_runtime_input_files(input_paths)
+
+    try:
+      script_source = script_path.read_text(encoding="utf-8")
+    except Exception:
+      script_source = script_path.read_bytes().decode("utf-8", errors="replace")
+
+    from js import runSnakemakeWasmRScript
+
+    async def _run_r_script_async():
+      return await runSnakemakeWasmRScript(
+        script_source,
+        {
+          "timeoutMs": 300000,
+          "inputPaths": input_paths,
+          "inputFiles": input_files,
+          "outputPaths": output_paths,
+        },
+      )
+
+    loop = asyncio.get_running_loop()
+    result = loop.run_until_complete(_run_r_script_async())
+
+    if hasattr(result, "to_py"):
+      result = result.to_py()
+
+    exit_code = 0
+    stderr = ""
+    stdout = ""
+    bridge_error = ""
     if isinstance(result, dict):
-      for file_entry in result.get("files", []):
-        if not isinstance(file_entry, dict):
-          continue
+      try:
+        exit_code = int(result.get("exitCode", 0) or 0)
+      except Exception:
+        exit_code = 0
+      stderr = str(result.get("stderr", "") or "")
+      stdout = str(result.get("stdout", "") or "")
+      bridge_error = str(result.get("error", "") or "")
 
-        rel_path = str(file_entry.get("path", "")).strip()
-        if not rel_path:
-          continue
-        if rel_path.startswith("/") or ".." in rel_path:
-          raise RuntimeError(f"Rejected unsafe bash output path: {rel_path!r}")
+    if exit_code != 0:
+      error_parts = []
+      if bridge_error:
+        error_parts.append(f"bridge_error={bridge_error}")
+      if stderr:
+        error_parts.append(f"stderr={stderr}")
+      if stdout:
+        error_parts.append(f"stdout={stdout}")
+      if not error_parts:
+        error_parts.append(f"script={script_path.as_posix()}")
 
-        out_path = Path(rel_path)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
+      raise RuntimeError(
+        f"R script failed in webR (exit {exit_code}): {' | '.join(error_parts)}"
+      )
 
-        encoding = str(file_entry.get("encoding", "base64"))
-        if encoding == "base64":
-          payload = str(file_entry.get("base64", ""))
-          out_path.write_bytes(_base64.b64decode(payload))
-        elif encoding == "utf-8":
-          out_path.write_text(str(file_entry.get("text", "")), encoding="utf-8")
-        else:
-          raise RuntimeError(
-            f"Unsupported bash output encoding {encoding!r} for {rel_path!r}"
-          )
+    import base64 as _base64
+
+    _materialize_script_result_files(result, _base64)
 
     return result
 
   _snakemake_script.PythonScript.execute_script = _pyodide_python_execute_script
   _snakemake_script.BashScript.execute_script = _pyodide_bash_execute_script
+  _snakemake_script.RScript.execute_script = _pyodide_r_execute_script
   print("Patched snakemake PythonScript.execute_script for emscripten")
 except Exception as _script_patch_error:
   print(f"Python script execution patch unavailable: {_script_patch_error}")
@@ -1016,21 +1542,29 @@ with SnakemakeApi(
     dag_api = workflow_api.dag(
         dag_settings=DAGSettings(),
     )
-    ok = dag_api.execute_workflow(
-        executor="wasm",
-        execution_settings=ExecutionSettings(),
-      scheduling_settings=SchedulingSettings(scheduler="greedy"),
-      scheduler_settings=GreedySchedulerSettings(
-        greediness=1.0,
-        omit_prioritize_by_temp_and_input=False,
-      ),
-      greedy_scheduler_settings=GreedySchedulerSettings(
-        greediness=1.0,
-        omit_prioritize_by_temp_and_input=False,
-      ),
-        executor_settings=_build_executor_settings(),
-        updated_files=updated_files,
-    )
+    try:
+      ok = dag_api.execute_workflow(
+          executor="wasm",
+          execution_settings=ExecutionSettings(),
+        scheduling_settings=SchedulingSettings(scheduler="greedy"),
+        scheduler_settings=GreedySchedulerSettings(
+          greediness=1.0,
+          omit_prioritize_by_temp_and_input=False,
+        ),
+        greedy_scheduler_settings=GreedySchedulerSettings(
+          greediness=1.0,
+          omit_prioritize_by_temp_and_input=False,
+        ),
+          executor_settings=_build_executor_settings(),
+          updated_files=updated_files,
+      )
+    #snakemake_interface_common.exceptions.WorkflowError
+    except WorkflowError as workflow_error:
+      print(f"Workflow execution failed with WorkflowError: {workflow_error}")
+      ok = False
+    except Exception as general_error:
+      print(f"Workflow execution failed with unexpected error: {general_error}")
+      ok = False
 
     status["run_ok"] = ok
 status["written_files"] = [
@@ -1218,7 +1752,7 @@ const handleWorkerMessage = (event) => {
         effectiveParallelJobs
       );
       syncOutputArtifacts(payload?.output_files);
-      postProgress({ stage: "workflow", status: "finished" });
+      // postProgress({ stage: "workflow", status: "finished" });
       postMessage({ type: "result", payload });
     } catch (err) {
       const errorText = err && err.message ? err.message : String(err);
