@@ -1,6 +1,8 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { Tabs } from '@skeletonlabs/skeleton-svelte';
+	import { File, FileCode, FileBraces, FileText } from '@lucide/svelte';
+	import snakemakeLogoUrl from '$lib/assets/snakemake-logo.svg';
 
 	export interface IdeTabItem {
 		id: string;
@@ -27,6 +29,23 @@
 	} = $props();
 
 	const tabLabel = (tab: IdeTabItem) => tab.path.trim() || 'untitled';
+	const isSnakefileTab = (tab: IdeTabItem) => {
+		const label = tabLabel(tab).toLowerCase();
+		return label === 'snakefile' || label.endsWith('/snakefile') || label.endsWith('.smk');
+	};
+	const tabIcon = (tab: IdeTabItem) => {
+		const label = tabLabel(tab).toLowerCase();
+		if (label.endsWith('.py') || label.endsWith('.r') || label.endsWith('.js') || label.endsWith('.ts')) {
+			return FileCode;
+		}
+		if (label.endsWith('.yaml') || label.endsWith('.yml') || label.endsWith('.json')) {
+			return FileBraces;
+		}
+		if (label.endsWith('.txt') || label.endsWith('.log') || label.endsWith('.md') || label.endsWith('.snakefile')) {
+			return FileText;
+		}
+		return File;
+	};
 	const activeTab = $derived(tabs.find((tab) => tab.id === activeTabId) ?? null);
 	let LazyCodeEditor: any = $state(null);
 
@@ -49,9 +68,17 @@
 		<Tabs.List class="flex border-b border-slate-200 overflow-x-auto mb-0 mt-2">
 
 			{#each tabs as tab}
+				{@const Icon = tabIcon(tab)}
 
 				<Tabs.Trigger value={tab.id}>
-					{tabLabel(tab)}
+					<span class="inline-flex items-center gap-1.5">
+						{#if isSnakefileTab(tab)}
+							<img src={snakemakeLogoUrl} alt="Snakefile" class="size-3.5" />
+						{:else}
+							<Icon class="size-3.5" />
+						{/if}
+						{tabLabel(tab)}
+					</span>
 				</Tabs.Trigger>
 
 			{/each}
@@ -63,7 +90,7 @@
 					onAdd();
 				}}
 				onmousedown={(e) => e.stopPropagation()}
-				class="ml-1 px-2 text-sm text-slate-600 hover:text-slate-900 border border-slate-200"
+				class="mx-1 px-2 text-sm text-slate-600 hover:text-slate-900 border border-slate-200"
 				aria-label="Add file tab"
 			>
 				+
