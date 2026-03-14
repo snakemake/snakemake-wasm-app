@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import os
 from pathlib import Path
 import sys
+import time
 from typing import Optional
 
 from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
@@ -208,7 +209,9 @@ class Executor(RealExecutor):
         if callable(super_post_init):
             super_post_init()
         self._async_shell_jobs: dict[str, SubmittedJobInfo] = {}
+        self._async_shell_submitted_at: dict[str, float] = {}
         self._async_run_jobs: dict[str, tuple[SubmittedJobInfo, asyncio.Task]] = {}
+        self._async_run_submitted_at: dict[str, float] = {}
         self._warned_sync_run_parallel_limit = False
         self._run_job_counter = 0
         self._job_update_cursor = 0
@@ -219,10 +222,47 @@ class Executor(RealExecutor):
     def get_python_executable(self):
         return sys.executable
 
-    def _ensure_shell_benchmark_files(self, job: JobExecutorInterface) -> None:
+    @staticmethod
+    def _total_file_size_mb(paths: list[str]) -> float:
+        total_mb = 0.0
+        for raw_path in paths:
+            path_str = str(raw_path).strip()
+            if not path_str:
+                continue
+            try:
+                path = Path(path_str)
+                if path.exists() and path.is_file():
+                    total_mb += path.stat().st_size / 1024.0 / 1024.0
+            except Exception:
+                continue
+        return total_mb
+
+    def _ensure_shell_benchmark_files(
+        self,
+        job: JobExecutorInterface,
+        running_time_s: Optional[float] = None,
+    ) -> None:
         benchmark_paths = _job_paths(job, "benchmark")
         if not benchmark_paths:
             return
+
+        input_paths = _job_paths(job, "input")
+        output_paths = _dedupe_paths(
+            [
+                *_job_paths(job, "output"),
+                *_job_paths(job, "benchmark"),
+                *_job_paths(job, "log"),
+            ]
+        )
+        io_in_mb = self._total_file_size_mb(input_paths)
+        io_out_mb = self._total_file_size_mb(output_paths)
+
+        try:
+            duration = float(running_time_s) if running_time_s is not None else 0.0
+        except Exception:
+            duration = 0.0
+        duration = max(0.0, duration)
+        duration_for_record = max(duration, 1e-9)
 
         for rel_path in benchmark_paths:
             rel_path = str(rel_path).strip()
@@ -245,8 +285,18 @@ class Executor(RealExecutor):
                 benchmark_record.wildcards = getattr(job, "wildcards", {})
                 benchmark_record.params = getattr(job, "params", {})
                 benchmark_record.resources = getattr(job, "resources", {})
-                benchmark_record.input = getattr(job, "input", [])
-                benchmark_record.threads = getattr(job, "threads", 1)
+                benchmark_record.input = input_paths
+                benchmark_record.threads = 1
+                benchmark_record.running_time = duration_for_record
+                benchmark_record.cpu_time = duration
+                benchmark_record.cpu_usage = 0.0
+                benchmark_record.io_in = io_in_mb
+                benchmark_record.io_out = io_out_mb
+                benchmark_record.max_rss = None
+                benchmark_record.max_vms = None
+                benchmark_record.max_uss = None
+                benchmark_record.max_pss = None
+                benchmark_record.data_collected = True
 
                 write_benchmark_records(
                     [benchmark_record],
@@ -294,7 +344,7 @@ class Executor(RealExecutor):
             value = int(getattr(self.executor_settings, "max_parallel_jobs", 1) or 1)
         except Exception:
             value = 1
-        return max(1, value)
+        return max(2, value)
 
     def job_args_and_prepare(self, job: JobExecutorInterface) -> dict:
         self.workflow.async_run(job.prepare())
@@ -315,11 +365,25 @@ class Executor(RealExecutor):
         if job.is_group():
             raise WorkflowError("wasm executor does not support group jobs yet")
 
-        threads = int(getattr(job, "threads", 1) or 1)
+        try:
+            threads = int(getattr(job, "threads", 1) or 1)
+        except Exception:
+            threads = 1
+
         if threads != 1:
-            raise WorkflowError(
-                f"wasm executor currently supports only threads: 1, got {threads}"
-            )
+            logger = getattr(self, "logger", None)
+            if logger is not None and hasattr(logger, "warning"):
+                logger.warning(
+                    "wasm executor supports only threads=1; forcing rule %r jobid=%r threads %r -> 1",
+                    getattr(getattr(job, "rule", None), "name", "<unknown>"),
+                    getattr(job, "jobid", None),
+                    threads,
+                )
+
+            try:
+                setattr(job, "threads", 1)
+            except Exception:
+                pass
 
     @staticmethod
     def _rule_has_directive_action(job: JobExecutorInterface) -> bool:
@@ -357,6 +421,7 @@ class Executor(RealExecutor):
             [
                 *_job_paths(job, "output"),
                 *_job_paths(job, "benchmark"),
+                *_job_paths(job, "log"),
             ]
         )
         input_paths = _job_paths(job, "input")
@@ -369,6 +434,7 @@ class Executor(RealExecutor):
             ) from e
 
         async def _run_shell():
+            started_at = time.perf_counter()
             result = await runSnakemakeWasmShellCommand(
                 command,
                 output_paths,
@@ -422,7 +488,11 @@ class Executor(RealExecutor):
                         f"Unsupported shell output encoding {encoding!r} for {rel_path!r}"
                     )
 
-            self._ensure_shell_benchmark_files(job)
+            self._ensure_shell_benchmark_files(
+                job,
+                running_time_s=(time.perf_counter() - started_at),
+            )
+            self._ensure_shell_log_files(job)
 
         self.workflow.async_run(_run_shell())
 
@@ -436,6 +506,7 @@ class Executor(RealExecutor):
             [
                 *_job_paths(job, "output"),
                 *_job_paths(job, "benchmark"),
+                *_job_paths(job, "log"),
             ]
         )
         input_paths = _job_paths(job, "input")
@@ -447,6 +518,7 @@ class Executor(RealExecutor):
                 "Missing JS bridge function runSnakemakeWasmShellCommand in worker global scope"
             ) from e
 
+        started_at = time.perf_counter()
         result = await runSnakemakeWasmShellCommand(
             command,
             output_paths,
@@ -477,7 +549,11 @@ class Executor(RealExecutor):
             )
 
         self._materialize_synced_files(result.get("files", []))
-        self._ensure_shell_benchmark_files(job)
+        self._ensure_shell_benchmark_files(
+            job,
+            running_time_s=(time.perf_counter() - started_at),
+        )
+        self._ensure_shell_log_files(job)
 
     def _materialize_synced_files(self, files) -> None:
         if not isinstance(files, list):
@@ -505,6 +581,25 @@ class Executor(RealExecutor):
                     f"Unsupported async output encoding {encoding!r} for {rel_path!r}"
                 )
 
+    def _ensure_shell_log_files(self, job: JobExecutorInterface) -> None:
+        log_paths = _job_paths(job, "log")
+        if not log_paths:
+            return
+
+        for rel_path in log_paths:
+            rel_path = str(rel_path).strip()
+            if not rel_path:
+                continue
+            if not _is_safe_relative_path(rel_path):
+                raise WorkflowError(f"Rejected unsafe log output path: {rel_path!r}")
+
+            file_path = Path(rel_path)
+            if file_path.exists():
+                continue
+
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_text("", encoding="utf-8")
+
     def _submit_async_shell_job(self, job: JobExecutorInterface) -> str:
         command = self._resolve_shell_command(job)
         if not command:
@@ -516,6 +611,7 @@ class Executor(RealExecutor):
             [
                 *_job_paths(job, "output"),
                 *_job_paths(job, "benchmark"),
+                *_job_paths(job, "log"),
             ]
         )
         input_paths = _job_paths(job, "input")
@@ -557,6 +653,7 @@ class Executor(RealExecutor):
             raise WorkflowError(
                 f"Duplicate async external job id {external_job_id!r} for rule {job.rule.name!r}"
             )
+        self._async_shell_submitted_at[external_job_id] = time.perf_counter()
         return external_job_id
 
     def _job_args_for_run_wrapper(self, job: JobExecutorInterface):
@@ -584,8 +681,10 @@ class Executor(RealExecutor):
 
         benchmark = None
         benchmark_repeats = job.benchmark_repeats or 1
+        # In wasm context, benchmark records are written by executor-side handling
+        # to avoid run_wrapper benchmark records with incomplete process metrics.
         if job.benchmark is not None:
-            benchmark = str(job.benchmark)
+            benchmark = None
 
         return (
             job.rule,
@@ -624,8 +723,12 @@ class Executor(RealExecutor):
 
     def _execute_run_rule(self, job: JobExecutorInterface):
         from snakemake.executors.local import run_wrapper
-
+        started_at = time.perf_counter()
         run_wrapper(*self._job_args_for_run_wrapper(job))
+        self._ensure_shell_benchmark_files(
+            job,
+            running_time_s=(time.perf_counter() - started_at),
+        )
 
     def _submit_async_run_job(self, job: JobExecutorInterface, job_info: SubmittedJobInfo) -> str:
         external_job_id = f"run_{job.jobid}_{self._run_job_counter}"
@@ -641,6 +744,7 @@ class Executor(RealExecutor):
 
         task = asyncio.create_task(_execute())
         self._async_run_jobs[external_job_id] = (job_info, task)
+        self._async_run_submitted_at[external_job_id] = time.perf_counter()
         return external_job_id
 
     def run_jobs(self, jobs: list[JobExecutorInterface]):
@@ -825,6 +929,12 @@ class Executor(RealExecutor):
             )
             if status == "success":
                 self._materialize_synced_files(update.get("files", []))
+                started_at = self._async_shell_submitted_at.get(external_job_id)
+                duration = None
+                if started_at is not None:
+                    duration = max(0.0, time.perf_counter() - started_at)
+                self._ensure_shell_benchmark_files(job_info.job, running_time_s=duration)
+                self._ensure_shell_log_files(job_info.job)
                 self.report_job_success(job_info)
                 completed_ids.add(external_job_id)
                 completed_job_keys.add(self._job_key(job_info.job))
@@ -856,6 +966,11 @@ class Executor(RealExecutor):
                     msg=f"Failed to execute async run job: {error}",
                 )
             else:
+                started_at = self._async_run_submitted_at.get(run_id)
+                duration = None
+                if started_at is not None:
+                    duration = max(0.0, time.perf_counter() - started_at)
+                self._ensure_shell_benchmark_files(run_job_info.job, running_time_s=duration)
                 self.report_job_success(run_job_info)
             self._debug_log(
                 f"run-task complete id={run_id} done={run_task.done()} cancelled={run_task.cancelled()} job_key={self._job_key(run_job_info.job)}"
@@ -863,8 +978,10 @@ class Executor(RealExecutor):
 
         for completed_id in completed_ids:
             self._async_shell_jobs.pop(completed_id, None)
+            self._async_shell_submitted_at.pop(completed_id, None)
         for completed_run_id in completed_run_ids:
             self._async_run_jobs.pop(completed_run_id, None)
+            self._async_run_submitted_at.pop(completed_run_id, None)
 
         self._debug_log(
             f"post-complete shell_remaining={list(self._async_shell_jobs.keys())} run_remaining={list(self._async_run_jobs.keys())} completed_ids={list(completed_ids)} completed_job_keys={list(completed_job_keys)}"
@@ -936,9 +1053,11 @@ class Executor(RealExecutor):
                 pass
             for shell_id in shell_ids_to_cancel:
                 self._async_shell_jobs.pop(shell_id, None)
+                self._async_shell_submitted_at.pop(shell_id, None)
 
         for run_id in run_ids_to_cancel:
             run_item = self._async_run_jobs.pop(run_id, None)
+            self._async_run_submitted_at.pop(run_id, None)
             if run_item is None:
                 continue
             _, run_task = run_item
@@ -954,11 +1073,13 @@ class Executor(RealExecutor):
             except Exception:
                 pass
             self._async_shell_jobs.clear()
+            self._async_shell_submitted_at.clear()
 
         if self._async_run_jobs:
             for _run_id, (_job_info, run_task) in list(self._async_run_jobs.items()):
                 run_task.cancel()
             self._async_run_jobs.clear()
+            self._async_run_submitted_at.clear()
         return None
 
     def cancel(self):
