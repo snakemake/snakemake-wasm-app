@@ -11,6 +11,7 @@
 	import RunControls from '$lib/components/RunControls.svelte';
 	import OutputDownloads from '$lib/components/OutputDownloads.svelte';
 	import LogPanel from '$lib/components/LogPanel.svelte';
+	import ConfigPanel from '$lib/components/ConfigPanel.svelte';
 	import { DEFAULT_CONFIG, FALLBACK_SNAKEFILE, RUNTIME_WHEELS } from '$lib/constants/runtime';
 	import { bytesToBase64, base64ToBytes } from '$lib/utils/encoding';
 	import { normalizeVmOutputPath } from '$lib/utils/files';
@@ -142,6 +143,9 @@
 	let runtimeSupportLinkLabel: string | null = null;
 	let maxParallelJobs = DEFAULT_MAX_PARALLEL_JOBS;
 	let envVarsInput = '';
+	let runtimeFilesInput = '';
+	let runtimeFilesSyncInFlight = false;
+	let runtimeFilesSyncQueued = false;
 	let runStartedAt: number | null = null;
 	let runElapsedMs = 0;
 	let runElapsedTimer: ReturnType<typeof setInterval> | null = null;
@@ -276,6 +280,7 @@
 	const persistIdeStateToUrl = () => {
 		const encoded = serializeIdeState();
 		const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+		const searchParams = new URLSearchParams(window.location.search);
 		hashParams.set(IDE_STATE_HASH_KEY, encoded);
 
 		const normalizedEnvInput = String(envVarsInput ?? '');
@@ -286,8 +291,19 @@
 			hashParams.delete(ENV_VARS_HASH_KEY);
 		}
 
+		const runtimeUrlLines = String(runtimeFilesInput ?? '')
+			.split(/\r?\n/)
+			.map((line) => line.trim())
+			.filter((line) => line.length > 0 && !line.startsWith('#'));
+
+		searchParams.delete(RUNTIME_FILES_PARAM_KEY);
+		for (const runtimeUrl of runtimeUrlLines) {
+			searchParams.append(RUNTIME_FILES_PARAM_KEY, runtimeUrl);
+		}
+
 		const nextHash = hashParams.toString();
-		const nextUrl = `${window.location.pathname}${window.location.search}${nextHash ? `#${nextHash}` : ''}`;
+		const nextSearch = searchParams.toString();
+		const nextUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ''}${nextHash ? `#${nextHash}` : ''}`;
 		window.history.replaceState(window.history.state, '', nextUrl);
 	};
 
@@ -497,9 +513,17 @@
 		if (values.length === 0) return [];
 
 		return values
-			.flatMap((value) => value.split(','))
 			.map((value) => value.trim())
 			.filter((value) => value.length > 0);
+	};
+
+	const restoreRuntimeFilesInputFromUrl = () => {
+		const searchParams = new URLSearchParams(window.location.search);
+		const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+		const requestedUrls = [...collectRuntimeFileUrls(searchParams), ...collectRuntimeFileUrls(hashParams)];
+		const uniqueUrls = [...new Set(requestedUrls)];
+
+		runtimeFilesInput = uniqueUrls.join('\n');
 	};
 
 	const runtimeFileNameFromUrl = (url: URL, index: number): string => {
@@ -511,34 +535,68 @@
 		return `runtime_${index + 1}.bin`;
 	};
 
-	const ingestRuntimeFilesFromUrlParams = async () => {
-		const searchParams = new URLSearchParams(window.location.search);
-		const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ''));
-		const requestedUrls = [...collectRuntimeFileUrls(searchParams), ...collectRuntimeFileUrls(hashParams)];
-		if (requestedUrls.length === 0) return;
+	const parseRuntimeFileInputLines = (rawInput: string): string[] =>
+		String(rawInput ?? '')
+			.split(/\r?\n/)
+			.map((line) => line.trim())
+			.filter((line) => line.length > 0 && !line.startsWith('#'));
 
-		const uniqueUrls = [...new Set(requestedUrls)];
-		appendLog('[ui] runtimefiles: loading from URL params', uniqueUrls.length);
+	const normalizeRuntimeFileUrl = (rawUrl: string): string | null => {
+		try {
+			const parsedUrl = new URL(rawUrl);
+			if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+				return null;
+			}
+			return parsedUrl.toString();
+		} catch {
+			return null;
+		}
+	};
+
+	const syncRuntimeFilesFromConfigInput = async () => {
+		const lines = parseRuntimeFileInputLines(runtimeFilesInput);
+		const desiredUrls = new Set<string>();
+		const invalidUrls: string[] = [];
+
+		for (const line of lines) {
+			const normalizedUrl = normalizeRuntimeFileUrl(line);
+			if (!normalizedUrl) {
+				invalidUrls.push(line);
+				continue;
+			}
+			desiredUrls.add(normalizedUrl);
+		}
+
+		if (invalidUrls.length > 0) {
+			appendLog('[ui] runtimefiles: invalid URL lines skipped', invalidUrls);
+		}
+
+		let removedCount = 0;
+		if (invalidUrls.length === 0) {
+			for (const [path, entry] of [...uploadedFiles.entries()]) {
+				if (!entry.sourceUrl) continue;
+				if (desiredUrls.has(entry.sourceUrl)) continue;
+				uploadedFiles.delete(path);
+				removedCount += 1;
+			}
+		}
 
 		let addedCount = 0;
-
-		for (let index = 0; index < uniqueUrls.length; index += 1) {
-			const rawUrl = uniqueUrls[index];
+		const desiredUrlList = [...desiredUrls];
+		for (let index = 0; index < desiredUrlList.length; index += 1) {
+			const normalizedUrl = desiredUrlList[index];
+			const alreadyQueued = [...uploadedFiles.values()].some((entry) => entry.sourceUrl === normalizedUrl);
+			if (alreadyQueued) continue;
 
 			try {
-				const parsedUrl = new URL(rawUrl);
-				if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
-					appendLog('[ui] runtimefiles: skipped unsupported URL scheme', rawUrl);
-					continue;
-				}
-
-				const response = await fetch(parsedUrl.toString());
+				const response = await fetch(normalizedUrl);
 				if (!response.ok) {
-					appendLog('[ui] runtimefiles: failed to fetch', parsedUrl.toString(), `HTTP ${response.status}`);
+					appendLog('[ui] runtimefiles: failed to fetch', normalizedUrl, `HTTP ${response.status}`);
 					continue;
 				}
 
 				const bytes = new Uint8Array(await response.arrayBuffer());
+				const parsedUrl = new URL(normalizedUrl);
 				const fileName = runtimeFileNameFromUrl(parsedUrl, index);
 				const desiredPath = `data/${fileName}`;
 				const finalPath = makeUniqueUploadPath(desiredPath);
@@ -549,19 +607,38 @@
 						content: bytesToBase64(bytes)
 					},
 					sizeBytes: bytes.length,
-					sourceUrl: parsedUrl.toString()
+					sourceUrl: normalizedUrl
 				});
 				addedCount += 1;
-				appendLog('[ui] runtimefiles: loaded', parsedUrl.toString(), `-> ${finalPath}`);
+				appendLog('[ui] runtimefiles: loaded from config panel', normalizedUrl, `-> ${finalPath}`);
 			} catch (error) {
-				appendLog('[ui] runtimefiles: failed to load', rawUrl, String(error));
+				appendLog('[ui] runtimefiles: failed to load from config panel', normalizedUrl, String(error));
 			}
 		}
 
-		if (addedCount > 0) {
+		if (removedCount > 0 || addedCount > 0) {
 			refreshUploadedFilePaths();
-			appendLog('[ui] runtimefiles: queued from URL params', addedCount);
+			appendLog('[ui] runtimefiles: synced from config panel', { added: addedCount, removed: removedCount });
 		}
+	};
+
+	const queueRuntimeFilesSync = async () => {
+		runtimeFilesSyncQueued = true;
+		if (runtimeFilesSyncInFlight) return;
+
+		runtimeFilesSyncInFlight = true;
+		try {
+			while (runtimeFilesSyncQueued) {
+				runtimeFilesSyncQueued = false;
+				await syncRuntimeFilesFromConfigInput();
+			}
+		} finally {
+			runtimeFilesSyncInFlight = false;
+		}
+	};
+
+	const ingestRuntimeFilesFromConfiguredInput = async () => {
+		await syncRuntimeFilesFromConfigInput();
 	};
 
 	const createUntitledTab = (): IdeTabItem => {
@@ -1045,6 +1122,9 @@
 	const runWorkflow = async () => {
 		restartWorkerForRun();
 		if (!worker) return;
+
+		await ingestRuntimeFilesFromConfiguredInput();
+
 		const runInputs = buildRunInputsFromTabs();
 		if (!runInputs) return;
 		const envVarParse = parseEnvVarsInput(envVarsInput);
@@ -1129,7 +1209,14 @@
 		logs = [];
 	};
 
-	$: tabs, activeTabId, envVarsInput, scheduleIdeStatePersist();
+	$: tabs, activeTabId, envVarsInput, runtimeFilesInput, scheduleIdeStatePersist();
+
+	$: {
+		runtimeFilesInput;
+		if (ideUrlSyncReady) {
+			void queueRuntimeFilesSync();
+		}
+	}
 
 	onMount(() => {
 		applyWorkflowTitleFromUrl();
@@ -1156,7 +1243,8 @@
 				await loadDefaultSnakefile();
 			}
 
-			await ingestRuntimeFilesFromUrlParams();
+			restoreRuntimeFilesInputFromUrl();
+			await queueRuntimeFilesSync();
 
 			appendLog('[ui] onMount: starting shell prewarm');
 			ensureShell()
@@ -1275,16 +1363,12 @@
 					</Tabs.Content>
 
 					<Tabs.Content value="envvars" class="p-2 lg:flex-1 lg:min-h-0 lg:overflow-auto">
-						<div class="border border-slate-200 bg-white p-2">
-							<label for="envvars-input" class="block text-xs font-medium text-slate-700">Environment Variables</label>
-							<p class="mt-1 text-xs text-slate-500">One per line as <code>KEY=VALUE</code>. Example: <code>FEATURE_TEST_TOKEN=abc123</code></p>
-							<textarea
-								id="envvars-input"
-								class="mt-2 h-40 w-full resize-y border border-slate-300 p-2 text-xs font-mono"
-								placeholder="FEATURE_TEST_TOKEN=..."
-								bind:value={envVarsInput}
-							></textarea>
-						</div>
+						<ConfigPanel
+							envVarsInput={envVarsInput}
+							onEnvVarsInputChange={(v) => envVarsInput = v}
+							runtimeFilesInput={runtimeFilesInput}
+							onRuntimeFilesInputChange={(v) => runtimeFilesInput = v}
+						/>
 					</Tabs.Content>
 				</Tabs>
 			</div>
